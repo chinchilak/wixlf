@@ -1,170 +1,25 @@
+from collections.abc import Sequence
+from datetime import date, datetime, time
 import math
 import zipfile
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from datetime import date, datetime, time
-from typing import Final
 
 from lxml import etree
 
-NS_MAIN: Final[str] = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-NS_XML: Final[str] = "http://www.w3.org/XML/1998/namespace"
-
-TAG_WORKSHEET: Final[str] = f"{{{NS_MAIN}}}worksheet"
-TAG_SHEET_DATA: Final[str] = f"{{{NS_MAIN}}}sheetData"
-TAG_DIMENSION: Final[str] = f"{{{NS_MAIN}}}dimension"
-TAG_ROW: Final[str] = f"{{{NS_MAIN}}}row"
-TAG_CELL: Final[str] = f"{{{NS_MAIN}}}c"
-TAG_VALUE: Final[str] = f"{{{NS_MAIN}}}v"
-TAG_FORMULA: Final[str] = f"{{{NS_MAIN}}}f"
-TAG_INLINE_STR: Final[str] = f"{{{NS_MAIN}}}is"
-TAG_TEXT: Final[str] = f"{{{NS_MAIN}}}t"
-
-type CellScalar = str | int | float | bool | date | datetime | time | None
-
-# Translation table mapping illegal XML 1.0 characters to None (fast C-level str.translate)
-_ILLEGAL_XML_TRANS: Final[dict[int, None]] = dict.fromkeys(
-    [
-        *range(0x00, 0x09),      # NUL..BS (keeps 0x09 TAB, 0x0A LF)
-        0x0B,                    # VT
-        0x0C,                    # FF (keeps 0x0D CR)
-        *range(0x0E, 0x20),      # SO..US
-        *range(0xD800, 0xE000),  # UTF-16 surrogates
-        0xFFFE,
-        0xFFFF,
-    ],
-    None,
+from .constants import (
+    NS_XML,
+    TAG_CELL,
+    TAG_DIMENSION,
+    TAG_FORMULA,
+    TAG_INLINE_STR,
+    TAG_ROW,
+    TAG_SHEET_DATA,
+    TAG_TEXT,
+    TAG_VALUE,
+    TAG_WORKSHEET,
 )
-
-# Excel 1900 epoch (with Excel's intentional 1900 leap-year bug offset)
-_EXCEL_EPOCH: Final[datetime] = datetime(1899, 12, 30)
-
-
-def sanitize_xml_text(text: str) -> str:
-    """Strips characters forbidden in XML 1.0 using C-accelerated str.translate."""
-    return text.translate(_ILLEGAL_XML_TRANS)
-
-
-def col_to_idx(col_str: str) -> int:
-    """Converts column letters ('A' -> 1, 'Z' -> 26, 'AA' -> 27) to 1-based index."""
-    idx = 0
-    for ch in col_str.upper():
-        idx = idx * 26 + (ord(ch) - 64)
-    return idx
-
-
-def idx_to_col(col_idx: int) -> str:
-    """Converts 1-based column index (1 -> 'A', 27 -> 'AA') to column letters."""
-    chars: list[str] = []
-    n = col_idx
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        chars.append(chr(65 + rem))
-    chars.reverse()
-    return "".join(chars)
-
-
-def parse_coord(coord: str) -> tuple[int, int]:
-    """
-    Parses 'AA105' or '$AA$105' into (row_idx, col_idx) 1-based integers
-    using pure string/character operations without regex.
-    """
-    cleaned = coord.strip()
-    cleaned = cleaned.removeprefix("$")
-
-    split_idx = 0
-    length = len(cleaned)
-    while split_idx < length and cleaned[split_idx].isascii() and cleaned[split_idx].isalpha():
-        split_idx += 1
-
-    col_letters = cleaned[:split_idx]
-    row_part = cleaned[split_idx:]
-    row_part = row_part.removeprefix("$")
-
-    if (
-        not (1 <= len(col_letters) <= 3)
-        or not row_part
-        or not (row_part.isascii() and row_part.isdigit())
-    ):
-        raise ValueError(f"Invalid Excel cell coordinate: {coord!r}")
-
-    row_idx = int(row_part)
-    if row_idx < 1:
-        raise ValueError(f"Invalid Excel cell coordinate: {coord!r}")
-
-    return row_idx, col_to_idx(col_letters)
-
-
-def format_coord(row_idx: int, col_idx: int) -> str:
-    """Formats 1-based (row_idx, col_idx) into 'AA105'."""
-    return f"{idx_to_col(col_idx)}{row_idx}"
-
-
-@dataclass(frozen=True, slots=True)
-class CellEdit:
-    """Represents a single cell mutation."""
-
-    row: int
-    col: int
-    value: CellScalar
-    style_id: str | None = None  # Optional explicit 's' attribute override
-    clear_style: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class RowEditBatch:
-    """Sorted cell mutations belonging to a single row."""
-
-    row: int
-    cells: tuple[CellEdit, ...]  # Strictly sorted by col ascending
-
-
-@dataclass(frozen=True, slots=True)
-class SheetEditPlan:
-    """
-    Pre-sorted, immutable, picklable edit plan for a single worksheet.
-    Passed across ProcessPoolExecutor boundaries.
-    """
-
-    rows: tuple[RowEditBatch, ...]  # Strictly sorted by row ascending
-
-    @classmethod
-    def from_dict(
-        cls,
-        cell_map: Mapping[str | tuple[int, int], CellScalar],
-        styles: Mapping[str | tuple[int, int], str] | None = None,
-    ) -> "SheetEditPlan":
-        """
-        Compiles an unsorted dict like {'B5': 42, (1, 1): 'Title'} into a
-        strictly sorted SheetEditPlan ready for single-pass streaming.
-        """
-        by_row: dict[int, dict[int, CellEdit]] = {}
-        style_lookup: dict[tuple[int, int], str] = {}
-
-        if styles:
-            for key, s_id in styles.items():
-                r, c = parse_coord(key) if isinstance(key, str) else key
-                style_lookup[(r, c)] = str(s_id)
-
-        for key, val in cell_map.items():
-            r, c = parse_coord(key) if isinstance(key, str) else key
-            if r < 1 or c < 1:
-                raise ValueError(f"Row and column must be >= 1, got ({r}, {c})")
-            by_row.setdefault(r, {})[c] = CellEdit(
-                row=r,
-                col=c,
-                value=val,
-                style_id=style_lookup.get((r, c)),
-            )
-
-        sorted_batches = tuple(
-            RowEditBatch(
-                row=r,
-                cells=tuple(by_row[r][c] for c in sorted(by_row[r])),
-            )
-            for r in sorted(by_row)
-        )
-        return cls(rows=sorted_batches)
+from .models import CellEdit, RowEditBatch, SheetEditPlan
+from .utils.coords import format_coord, parse_coord
+from .utils.xml_text import sanitize_xml_text, to_excel_serial
 
 
 class SheetStreamPatcher:
@@ -331,7 +186,7 @@ class SheetStreamPatcher:
             )
             e_idx += 1
 
-        # Replace row children in-place while keeping <row> attributes (ht, customHeight, s, spans)
+        # Replace row children in-place while keeping <row> attributes (ht, customHeight, s)
         row_elem[:] = new_children
         # Clear cached spans attribute if new columns may have widened the row
         row_elem.attrib.pop("spans", None)
@@ -376,7 +231,6 @@ class SheetStreamPatcher:
                 v_elem = etree.SubElement(c_elem, TAG_VALUE)
                 v_elem.text = "#NUM!"
             else:
-                # Default OOXML cell type is numeric ('n' can be omitted)
                 v_elem = etree.SubElement(c_elem, TAG_VALUE)
                 v_elem.text = repr(val) if isinstance(val, float) else str(val)
             return c_elem
@@ -385,7 +239,7 @@ class SheetStreamPatcher:
         if isinstance(val, (datetime, date, time)):
             c_elem.set("t", "n")
             v_elem = etree.SubElement(c_elem, TAG_VALUE)
-            v_elem.text = repr(self._to_excel_serial(val))
+            v_elem.text = repr(to_excel_serial(val))
             return c_elem
 
         # 5. Formula vs. Inline String
@@ -405,29 +259,6 @@ class SheetStreamPatcher:
             return c_elem
 
         raise TypeError(f"Unsupported cell value type: {type(val).__name__}")
-
-    @staticmethod
-    def _to_excel_serial(dt_val: datetime | date | time) -> float:
-        """Converts Python date/datetime/time into Excel 1900 serial float."""
-        if isinstance(dt_val, datetime):
-            naive = dt_val.replace(tzinfo=None)
-            delta = naive - _EXCEL_EPOCH
-            serial = delta.days + (delta.seconds + delta.microseconds / 1_000_000) / 86400.0
-        elif isinstance(dt_val, date):
-            naive = datetime(dt_val.year, dt_val.month, dt_val.day)
-            serial = float((naive - _EXCEL_EPOCH).days)
-        else:  # time
-            serial = (
-                dt_val.hour * 3600
-                + dt_val.minute * 60
-                + dt_val.second
-                + dt_val.microsecond / 1_000_000
-            ) / 86400.0
-
-        # Adjust for Excel's fictional Feb 29, 1900 (serial 60)
-        if not isinstance(dt_val, time) and serial <= 60:
-            serial -= 1.0
-        return serial
 
     @staticmethod
     def _prune_element(elem: etree._Element) -> None:

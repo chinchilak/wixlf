@@ -1,95 +1,24 @@
+from collections.abc import Mapping
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
-import posixpath
+from pathlib import Path
 import shutil
 import tempfile
-import zipfile
-from collections.abc import Callable, Mapping
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
+import zipfile
 
 from lxml import etree
 
-# OOXML Namespaces
-NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-NS_REL_DOC = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-NS_REL_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
-NS_CT = "http://schemas.openxmlformats.org/package/2006/content-types"
-
-CALC_CHAIN_PATH = "xl/calcChain.xml"
-CALC_CHAIN_CT = (
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"
+from .constants import (
+    CALC_CHAIN_CT,
+    CALC_CHAIN_PATH,
+    CALC_CHAIN_REL_TYPE,
+    NS_CT,
+    NS_MAIN,
+    NS_REL_PKG,
+    PatchWorkerFn,
 )
-CALC_CHAIN_REL_TYPE = (
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain"
-)
-
-# PEP 695 native type statement
-# Signature: (src_zip_path, internal_sheet_path, sheet_edits, output_temp_xml_path) -> None
-type PatchWorkerFn = Callable[[str, str, Any, str], None]
-
-
-@dataclass(frozen=True, slots=True)
-class SheetInfo:
-    name: str
-    sheet_id: str
-    rel_id: str
-    zip_path: str  # e.g., "xl/worksheets/sheet1.xml"
-
-
-class PackageReader:
-    """
-    Reads small OOXML metadata files from an existing .xlsx/.xlsm archive
-    to resolve human-readable sheet names to internal zip paths.
-    """
-
-    def __init__(self, src_path: str | Path) -> None:
-        self.src_path = Path(src_path)
-
-    def get_sheets(self) -> dict[str, SheetInfo]:
-        """Returns a mapping of {sheet_name: SheetInfo}."""
-        with zipfile.ZipFile(self.src_path, "r") as zin:
-            wb_rels = self._parse_relationships(zin, "xl/_rels/workbook.xml.rels")
-            wb_root = etree.fromstring(zin.read("xl/workbook.xml"))
-
-        sheets: dict[str, SheetInfo] = {}
-        for sheet_elem in wb_root.findall(f".//{{{NS_MAIN}}}sheet"):
-            name = sheet_elem.get("name")
-            sheet_id = sheet_elem.get("sheetId", "")
-            rel_id = sheet_elem.get(f"{{{NS_REL_DOC}}}id")
-
-            if not name or not rel_id or rel_id not in wb_rels:
-                continue
-
-            target = wb_rels[rel_id]
-            zip_path = self._resolve_zip_path("xl/workbook.xml", target)
-            sheets[name] = SheetInfo(
-                name=name,
-                sheet_id=sheet_id,
-                rel_id=rel_id,
-                zip_path=zip_path,
-            )
-
-        return sheets
-
-    @staticmethod
-    def _parse_relationships(zin: zipfile.ZipFile, rels_path: str) -> dict[str, str]:
-        """Maps rId -> Target path."""
-        rels_root = etree.fromstring(zin.read(rels_path))
-        return {
-            rel_id: target
-            for rel in rels_root.findall(f"{{{NS_REL_PKG}}}Relationship")
-            if (rel_id := rel.get("Id")) and (target := rel.get("Target"))
-        }
-
-    @staticmethod
-    def _resolve_zip_path(base_file: str, target: str) -> str:
-        """Resolves relative or root-anchored OOXML targets to zip entry names."""
-        if target.startswith("/"):
-            return target.lstrip("/")
-        base_dir = posixpath.dirname(base_file)
-        return posixpath.normpath(posixpath.join(base_dir, target))
+from .utils.zip_io import clone_zip_info, copy_disk_file_to_zip, stream_zip_entry
 
 
 def _worker_entrypoint(
@@ -228,58 +157,33 @@ class PackageAssembler:
                         continue
 
                     if name in patched_files:
-                        self._copy_disk_file_to_zip(zout, info, patched_files[name])
+                        copy_disk_file_to_zip(
+                            zout, info, patched_files[name], self.chunk_size
+                        )
                         continue
 
                     if strip_calc_chain and name == "[Content_Types].xml":
                         cleaned = self._strip_calc_chain_content_type(zin.read(name))
-                        zout.writestr(self._clone_zip_info(info), cleaned)
+                        zout.writestr(clone_zip_info(info), cleaned)
                         continue
 
                     if strip_calc_chain and name == "xl/_rels/workbook.xml.rels":
                         cleaned = self._strip_calc_chain_rel(zin.read(name))
-                        zout.writestr(self._clone_zip_info(info), cleaned)
+                        zout.writestr(clone_zip_info(info), cleaned)
                         continue
 
                     if strip_calc_chain and name == "xl/workbook.xml":
                         updated = self._enable_full_calc_on_load(zin.read(name))
-                        zout.writestr(self._clone_zip_info(info), updated)
+                        zout.writestr(clone_zip_info(info), updated)
                         continue
 
-                    self._stream_zip_entry(zin, zout, info)
+                    stream_zip_entry(zin, zout, info, self.chunk_size)
 
             os.replace(staging_zip, self.dst_path)
         except Exception:
             if os.path.exists(staging_zip):
                 os.remove(staging_zip)
             raise
-
-    def _stream_zip_entry(
-        self, zin: zipfile.ZipFile, zout: zipfile.ZipFile, src_info: zipfile.ZipInfo
-    ) -> None:
-        """Copies a zip entry chunk-by-chunk with constant memory usage."""
-        dst_info = self._clone_zip_info(src_info)
-        with zin.open(src_info, "r") as src_f, zout.open(dst_info, "w") as dst_f:
-            shutil.copyfileobj(src_f, dst_f, length=self.chunk_size)
-
-    def _copy_disk_file_to_zip(
-        self, zout: zipfile.ZipFile, src_info: zipfile.ZipInfo, disk_path: str
-    ) -> None:
-        """Streams a patched temporary XML file into the zip archive."""
-        dst_info = self._clone_zip_info(src_info)
-        with open(disk_path, "rb") as src_f, zout.open(dst_info, "w") as dst_f:
-            shutil.copyfileobj(src_f, dst_f, length=self.chunk_size)
-
-    @staticmethod
-    def _clone_zip_info(src_info: zipfile.ZipInfo) -> zipfile.ZipInfo:
-        """Preserves filename, timestamp, and compression type while resetting sizes."""
-        info = zipfile.ZipInfo(
-            filename=src_info.filename, date_time=src_info.date_time
-        )
-        info.compress_type = src_info.compress_type
-        info.create_system = src_info.create_system
-        info.external_attr = src_info.external_attr
-        return info
 
     @staticmethod
     def _strip_calc_chain_content_type(xml_bytes: bytes) -> bytes:

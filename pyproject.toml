@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.14"
 authors = [
-    { name = "Martin Bednář", email = "chinchilak@protonmail.com" },
+    { name = "chinchilak" },
 ]
 keywords = ["excel", "xlsx", "xlsm", "lxml", "streaming", "openpyxl", "wixlf"]
 classifiers = [

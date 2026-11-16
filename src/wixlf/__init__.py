@@ -1,15 +1,11 @@
 from collections.abc import Mapping
 from pathlib import Path
 
-from .package_pipeline import PackageAssembler, PackageReader, SheetInfo
-from .sheet_patcher import (
-    CellEdit,
-    CellScalar,
-    RowEditBatch,
-    SheetEditPlan,
-    SheetStreamPatcher,
-    patch_sheet_worker,
-)
+from .assembler import PackageAssembler
+from .constants import CellScalar, PatchWorkerFn
+from .models import CellEdit, RowEditBatch, SheetEditPlan, SheetInfo
+from .patcher import SheetStreamPatcher, patch_sheet_worker
+from .reader import PackageReader
 
 __version__ = "0.1.0"
 
@@ -18,6 +14,7 @@ __all__ = [
     "CellScalar",
     "PackageAssembler",
     "PackageReader",
+    "PatchWorkerFn",
     "RowEditBatch",
     "SheetEditPlan",
     "SheetInfo",
