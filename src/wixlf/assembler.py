@@ -1,11 +1,11 @@
-from collections.abc import Mapping
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
-from pathlib import Path
 import shutil
 import tempfile
-from typing import Any
 import zipfile
+from collections.abc import Mapping
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
 
 from lxml import etree
 

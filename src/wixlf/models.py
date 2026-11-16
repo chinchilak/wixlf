@@ -48,7 +48,7 @@ class SheetEditPlan:
         cls,
         cell_map: Mapping[str | tuple[int, int], CellScalar],
         styles: Mapping[str | tuple[int, int], str] | None = None,
-    ) -> "SheetEditPlan":
+    ) -> SheetEditPlan:
         """
         Compiles an unsorted mapping like {'B5': 42, (1, 1): 'Title'} into a
         strictly sorted SheetEditPlan ready for single-pass streaming.

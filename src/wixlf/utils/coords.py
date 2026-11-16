@@ -23,8 +23,7 @@ def parse_coord(coord: str) -> tuple[int, int]:
     using pure string/character operations without regex.
     """
     cleaned = coord.strip()
-    if cleaned.startswith("$"):
-        cleaned = cleaned[1:]
+    cleaned = cleaned.removeprefix("$")
 
     split_idx = 0
     length = len(cleaned)
@@ -33,8 +32,7 @@ def parse_coord(coord: str) -> tuple[int, int]:
 
     col_letters = cleaned[:split_idx]
     row_part = cleaned[split_idx:]
-    if row_part.startswith("$"):
-        row_part = row_part[1:]
+    row_part = row_part.removeprefix("$")
 
     if (
         not (1 <= len(col_letters) <= 3)
