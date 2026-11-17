@@ -23,6 +23,7 @@ from .zip_io import (
     new_zip_info,
     resolve_zip_path,
     stream_zip_entry,
+    zip_entry_contains_formulas,
 )
 
 __all__ = [
@@ -47,4 +48,5 @@ __all__ = [
     "shift_sqref",
     "stream_zip_entry",
     "to_excel_serial",
+    "zip_entry_contains_formulas",
 ]

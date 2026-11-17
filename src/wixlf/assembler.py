@@ -41,6 +41,7 @@ from .utils.zip_io import (
     new_zip_info,
     resolve_zip_path,
     stream_zip_entry,
+    zip_entry_contains_formulas,
 )
 
 
@@ -112,6 +113,7 @@ class PackageAssembler:
         delete_sheets: Iterable[str] = (),
         move_sheets: Sequence[SheetMoveSpec] = (),
         shift_ops: Mapping[str, tuple[Sequence[AxisShiftOp], Sequence[AxisShiftOp]]] | None = None,
+        update_formulas: bool = True,
         force_recalc: bool = True,
     ) -> None:
         """
@@ -158,31 +160,39 @@ class PackageAssembler:
                 if path not in deleted_zip_paths
             }
 
-            # When rows/cols shift or sheets are deleted, formulas across any
-            # surviving worksheet may reference shifted coordinates -> stream all
-            # surviving sheets through SheetStreamPatcher with shift payloads.
+            # Attach shift/formula payloads to locally shifted sheets and any
+            # surviving sheets that actually contain '<f' formula tags.
             has_global_formula_shifts = bool(normalized_shifts or delete_set)
             if has_global_formula_shifts:
                 deleted_tuple = tuple(sorted(delete_set))
-                for s_name, s_zip_path in surviving_sheets.items():
-                    r_ops, c_ops = normalized_shifts.get(s_name, ((), ()))
-                    mutation = SheetStructureMutation(
-                        sheet_name=s_name,
-                        row_ops=r_ops,
-                        col_ops=c_ops,
-                        all_shifts=normalized_shifts,
-                        deleted_sheets=deleted_tuple,
-                    )
-                    existing_item = effective_dirty.get(s_zip_path)
-                    plan = (
-                        existing_item.plan
-                        if isinstance(existing_item, WorksheetTaskPayload)
-                        else (existing_item or SheetEditPlan.empty())
-                    )
-                    effective_dirty[s_zip_path] = WorksheetTaskPayload(
-                        plan=plan,
-                        mutation=mutation,
-                    )
+                with zipfile.ZipFile(self.src_path, "r") as zin:
+                    for s_name, s_zip_path in surviving_sheets.items():
+                        r_ops, c_ops = normalized_shifts.get(s_name, ((), ()))
+                        has_local = bool(r_ops or c_ops)
+                        if not has_local and not update_formulas:
+                            continue
+                        if not has_local and not zip_entry_contains_formulas(
+                            zin, s_zip_path, self.chunk_size
+                        ):
+                            continue
+
+                        mutation = SheetStructureMutation(
+                            sheet_name=s_name,
+                            row_ops=r_ops,
+                            col_ops=c_ops,
+                            all_shifts=normalized_shifts if update_formulas else {},
+                            deleted_sheets=deleted_tuple if update_formulas else (),
+                        )
+                        existing_item = effective_dirty.get(s_zip_path)
+                        plan = (
+                            existing_item.plan
+                            if isinstance(existing_item, WorksheetTaskPayload)
+                            else (existing_item or SheetEditPlan.empty())
+                        )
+                        effective_dirty[s_zip_path] = WorksheetTaskPayload(
+                            plan=plan,
+                            mutation=mutation,
+                        )
 
             patched_files = self._run_sheet_workers(
                 dirty_edits=effective_dirty,
@@ -200,7 +210,7 @@ class PackageAssembler:
                 table_shifts_by_zip=table_shifts_by_zip,
                 delete_sheet_names=delete_set,
                 move_sheets=move_sheets,
-                shift_ops=normalized_shifts,
+                shift_ops=normalized_shifts if update_formulas else {},
                 strip_calc_chain=force_recalc,
             )
 
@@ -426,9 +436,8 @@ class PackageAssembler:
         strip_calc_chain: bool,
     ) -> None:
         """
-        Streams entries into the destination archive without buffering whole files.
-        Untouched archive members are copied as raw compressed streams without
-        decompression/recompression overhead.
+        Streams entries into the destination archive without buffering whole files,
+        using fast deflate compression (compresslevel) across all streamed parts.
         """
         dst_dir = self.dst_path.parent
         dst_dir.mkdir(parents=True, exist_ok=True)
@@ -527,7 +536,13 @@ class PackageAssembler:
                         )
                         continue
 
-                    stream_zip_entry(zin, zout, info, self.chunk_size)
+                    stream_zip_entry(
+                        zin,
+                        zout,
+                        info,
+                        self.chunk_size,
+                        compresslevel=self.compresslevel,
+                    )
 
                 # Append brand-new worksheet XML files
                 for alloc in allocated_new:

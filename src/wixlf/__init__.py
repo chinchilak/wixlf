@@ -18,7 +18,7 @@ from .reader import PackageReader
 from .utils.coords import parse_col_ref, parse_range
 from .utils.shifting import AxisShiftOp
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "AxisShiftOp",
@@ -69,6 +69,7 @@ def patch_workbook(
     delete_sheets: Iterable[str] = (),
     move_sheets: Sequence[SheetMoveSpec | tuple[str, int | None]] = (),
     shift_ops: Mapping[str, tuple[Sequence[AxisShiftOp], Sequence[AxisShiftOp]]] | None = None,
+    update_formulas: bool = True,
     max_workers: int | None = None,
     compresslevel: int = 1,
     force_recalc: bool = True,
@@ -114,6 +115,7 @@ def patch_workbook(
         delete_sheets=delete_sheets,
         move_sheets=normalized_moves,
         shift_ops=shift_ops,
+        update_formulas=update_formulas,
         force_recalc=force_recalc,
     )
 
@@ -147,6 +149,7 @@ def delete_sheets(
     names: str | Iterable[str],
     *,
     dst_path: str | Path | None = None,
+    update_formulas: bool = True,
     compresslevel: int = 1,
 ) -> None:
     """
@@ -158,6 +161,7 @@ def delete_sheets(
         src_path=src_path,
         dst_path=dst_path,
         delete_sheets=target_names,
+        update_formulas=update_formulas,
         compresslevel=compresslevel,
     )
 
@@ -189,6 +193,7 @@ def insert_rows(
     count: int = 1,
     *,
     dst_path: str | Path | None = None,
+    update_formulas: bool = True,
     max_workers: int | None = None,
     compresslevel: int = 1,
 ) -> None:
@@ -202,6 +207,7 @@ def insert_rows(
         src_path=src_path,
         dst_path=dst_path,
         shift_ops={sheet: ([AxisShiftOp(start=row_idx, delta=count)], [])},
+        update_formulas=update_formulas,
         max_workers=max_workers,
         compresslevel=compresslevel,
     )
@@ -214,6 +220,7 @@ def delete_rows(
     count: int = 1,
     *,
     dst_path: str | Path | None = None,
+    update_formulas: bool = True,
     max_workers: int | None = None,
     compresslevel: int = 1,
 ) -> None:
@@ -227,6 +234,7 @@ def delete_rows(
         src_path=src_path,
         dst_path=dst_path,
         shift_ops={sheet: ([AxisShiftOp(start=row_idx, delta=-count)], [])},
+        update_formulas=update_formulas,
         max_workers=max_workers,
         compresslevel=compresslevel,
     )
@@ -239,6 +247,7 @@ def insert_cols(
     count: int = 1,
     *,
     dst_path: str | Path | None = None,
+    update_formulas: bool = True,
     max_workers: int | None = None,
     compresslevel: int = 1,
 ) -> None:
@@ -253,6 +262,7 @@ def insert_cols(
         src_path=src_path,
         dst_path=dst_path,
         shift_ops={sheet: ([], [AxisShiftOp(start=col_idx, delta=count)])},
+        update_formulas=update_formulas,
         max_workers=max_workers,
         compresslevel=compresslevel,
     )
@@ -265,6 +275,7 @@ def delete_cols(
     count: int = 1,
     *,
     dst_path: str | Path | None = None,
+    update_formulas: bool = True,
     max_workers: int | None = None,
     compresslevel: int = 1,
 ) -> None:
@@ -279,6 +290,7 @@ def delete_cols(
         src_path=src_path,
         dst_path=dst_path,
         shift_ops={sheet: ([], [AxisShiftOp(start=col_idx, delta=-count)])},
+        update_formulas=update_formulas,
         max_workers=max_workers,
         compresslevel=compresslevel,
     )

@@ -36,9 +36,15 @@ def stream_zip_entry(
     zout: zipfile.ZipFile,
     src_info: zipfile.ZipInfo,
     chunk_size: int,
+    compresslevel: int | None = 1,
 ) -> None:
+    """
+    Streams an untouched zip entry from zin to zout in constant O(1) memory
+    using fast deflate compression (compresslevel=1 by default).
+    """
     dst_info = clone_zip_info(src_info)
-    dst_info._compresslevel = 1
+    if compresslevel is not None and dst_info.compress_type == zipfile.ZIP_DEFLATED:
+        dst_info._compresslevel = compresslevel
     with zin.open(src_info, "r") as src_f, zout.open(dst_info, "w") as dst_f:
         shutil.copyfileobj(src_f, dst_f, length=chunk_size)
 
@@ -52,10 +58,32 @@ def copy_disk_file_to_zip(
 ) -> None:
     """Streams a temporary XML file from disk into the zip archive."""
     dst_info = clone_zip_info(target_info)
-    if compresslevel is not None:
+    if compresslevel is not None and dst_info.compress_type == zipfile.ZIP_DEFLATED:
         dst_info._compresslevel = compresslevel
     with (
         open(disk_path, "rb") as src_f,
         zout.open(dst_info, "w") as dst_f,
     ):
         shutil.copyfileobj(src_f, dst_f, length=chunk_size)
+
+
+def zip_entry_contains_formulas(
+    zin: zipfile.ZipFile,
+    zip_path: str,
+    chunk_size: int = 1024 * 1024,
+) -> bool:
+    """
+    Scans a worksheet XML stream in fixed-size chunks for '<f' tags without
+    building an XML DOM, allowing huge data-only sheets to skip lxml parsing
+    when no local row/column shifts apply.
+    """
+    overlap = b""
+    with zin.open(zip_path, "r") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                return False
+            buf = overlap + chunk
+            if b"<f>" in buf or b"<f " in buf:
+                return True
+            overlap = buf[-4:]
