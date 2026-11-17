@@ -44,6 +44,11 @@ class SheetEditPlan:
     rows: tuple[RowEditBatch, ...]  # Strictly sorted by row ascending
 
     @classmethod
+    def empty(cls) -> SheetEditPlan:
+        """Returns an empty edit plan (used when creating a blank worksheet)."""
+        return cls(rows=())
+
+    @classmethod
     def from_dict(
         cls,
         cell_map: Mapping[str | tuple[int, int], CellScalar],
@@ -80,3 +85,26 @@ class SheetEditPlan:
             for r in sorted(by_row)
         )
         return cls(rows=sorted_batches)
+
+
+@dataclass(frozen=True, slots=True)
+class NewSheetSpec:
+    """
+    Specification for creating a brand-new worksheet in the workbook.
+    position: 0-based tab index; None appends to the end.
+    """
+
+    name: str
+    plan: SheetEditPlan
+    position: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SheetMoveSpec:
+    """
+    Specification for repositioning an existing or newly created worksheet tab.
+    position: 0-based target index; None moves the sheet to the end.
+    """
+
+    name: str
+    position: int | None = None

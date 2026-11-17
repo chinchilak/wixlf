@@ -6,6 +6,8 @@ from datetime import date, datetime, time
 from lxml import etree
 
 from .constants import (
+    NS_MAIN,
+    NS_REL_DOC,
     NS_XML,
     TAG_CELL,
     TAG_DIMENSION,
@@ -24,8 +26,8 @@ from .utils.xml_text import sanitize_xml_text, to_excel_serial
 
 class SheetStreamPatcher:
     """
-    Streams an existing worksheet XML from a zip archive and writes a patched
-    version to disk using constant O(1) memory.
+    Streams an existing worksheet XML from a zip archive (or generates a new
+    worksheet XML from scratch) and writes to disk using constant O(1) memory.
     """
 
     def __init__(self, drop_dimension_tag: bool = True) -> None:
@@ -40,7 +42,7 @@ class SheetStreamPatcher:
         plan: SheetEditPlan,
         out_xml_path: str,
     ) -> None:
-        """Entrypoint compatible with PackageAssembler's PatchWorkerFn signature."""
+        """Streams and patches an existing worksheet entry inside src_zip_path."""
         with (
             zipfile.ZipFile(src_zip_path, "r") as zin,
             zin.open(sheet_zip_path, "r") as xml_in,
@@ -48,6 +50,22 @@ class SheetStreamPatcher:
         ):
             xf.write_declaration(standalone=True)
             self._stream_transform(xml_in, xf, plan.rows)
+
+    def write_new_sheet(
+        self,
+        plan: SheetEditPlan,
+        out_xml_path: str,
+    ) -> None:
+        """Streams a brand-new compliant worksheet XML file to out_xml_path."""
+        nsmap = {None: NS_MAIN, "r": NS_REL_DOC}
+        with etree.xmlfile(out_xml_path, encoding="utf-8") as xf:
+            xf.write_declaration(standalone=True)
+            with (
+                xf.element(TAG_WORKSHEET, nsmap=nsmap),
+                xf.element(TAG_SHEET_DATA),
+            ):
+                for batch in plan.rows:
+                    self._write_new_row(xf, batch)
 
     def _stream_transform(
         self,
@@ -253,7 +271,7 @@ class SheetStreamPatcher:
                 c_elem.set("t", "inlineStr")
                 is_elem = etree.SubElement(c_elem, TAG_INLINE_STR)
                 t_elem = etree.SubElement(is_elem, TAG_TEXT)
-                if clean_text != clean_text.strip() or "\n" in clean_text:
+                if clean_text != clean_text.strip() or "" in clean_text:
                     t_elem.set(f"{{{NS_XML}}}space", "preserve")
                 t_elem.text = clean_text
             return c_elem
@@ -270,7 +288,7 @@ class SheetStreamPatcher:
                 del parent[0]
 
 
-# Top-level picklable worker function for PackageAssembler
+# Top-level picklable worker functions for PackageAssembler
 def patch_sheet_worker(
     src_zip_path: str,
     sheet_zip_path: str,
@@ -279,3 +297,13 @@ def patch_sheet_worker(
 ) -> None:
     patcher = SheetStreamPatcher()
     patcher.patch_from_zip(src_zip_path, sheet_zip_path, plan, out_xml_path)
+
+
+def create_sheet_worker(
+    _src_zip_path: str,
+    _sheet_zip_path: str,
+    plan: SheetEditPlan,
+    out_xml_path: str,
+) -> None:
+    patcher = SheetStreamPatcher()
+    patcher.write_new_sheet(plan, out_xml_path)

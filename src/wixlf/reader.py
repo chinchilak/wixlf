@@ -11,14 +11,14 @@ from .utils.zip_io import resolve_zip_path
 class PackageReader:
     """
     Reads small OOXML metadata files from an existing .xlsx/.xlsm archive
-    to resolve human-readable sheet names to internal zip paths.
+    to resolve human-readable sheet names to internal zip paths in tab order.
     """
 
     def __init__(self, src_path: str | Path) -> None:
         self.src_path = Path(src_path)
 
     def get_sheets(self) -> dict[str, SheetInfo]:
-        """Returns a mapping of {sheet_name: SheetInfo}."""
+        """Returns an insertion-ordered mapping of {sheet_name: SheetInfo}."""
         with zipfile.ZipFile(self.src_path, "r") as zin:
             wb_rels = self._parse_relationships(zin, "xl/_rels/workbook.xml.rels")
             wb_root = etree.fromstring(zin.read("xl/workbook.xml"))

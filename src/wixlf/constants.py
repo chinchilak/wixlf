@@ -20,7 +20,14 @@ TAG_FORMULA: Final[str] = f"{{{NS_MAIN}}}f"
 TAG_INLINE_STR: Final[str] = f"{{{NS_MAIN}}}is"
 TAG_TEXT: Final[str] = f"{{{NS_MAIN}}}t"
 
-# Calculation chain identifiers
+# Content Types & Relationship Types
+WORKSHEET_CT: Final[str] = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+)
+WORKSHEET_REL_TYPE: Final[str] = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+)
+
 CALC_CHAIN_PATH: Final[str] = "xl/calcChain.xml"
 CALC_CHAIN_CT: Final[str] = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"

@@ -1,5 +1,6 @@
 import posixpath
 import shutil
+import time
 import zipfile
 
 
@@ -22,6 +23,14 @@ def clone_zip_info(src_info: zipfile.ZipInfo) -> zipfile.ZipInfo:
     return info
 
 
+def new_zip_info(filename: str) -> zipfile.ZipInfo:
+    """Creates a ZipInfo for a newly generated archive member with current timestamp."""
+    now = time.localtime()[:6]
+    info = zipfile.ZipInfo(filename=filename, date_time=now)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    return info
+
+
 def stream_zip_entry(
     zin: zipfile.ZipFile,
     zout: zipfile.ZipFile,
@@ -36,11 +45,11 @@ def stream_zip_entry(
 
 def copy_disk_file_to_zip(
     zout: zipfile.ZipFile,
-    src_info: zipfile.ZipInfo,
+    target_info: zipfile.ZipInfo,
     disk_path: str,
     chunk_size: int,
 ) -> None:
-    """Streams a patched temporary XML file from disk into the zip archive."""
-    dst_info = clone_zip_info(src_info)
+    """Streams a temporary XML file from disk into the zip archive."""
+    dst_info = clone_zip_info(target_info)
     with open(disk_path, "rb") as src_f, zout.open(dst_info, "w") as dst_f:
         shutil.copyfileobj(src_f, dst_f, length=chunk_size)
