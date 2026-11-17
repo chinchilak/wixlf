@@ -73,9 +73,8 @@ def zip_entry_contains_formulas(
     chunk_size: int = 1024 * 1024,
 ) -> bool:
     """
-    Scans a worksheet XML stream in fixed-size chunks for '<f' tags without
-    building an XML DOM, allowing huge data-only sheets to skip lxml parsing
-    when no local row/column shifts apply.
+    Scans a worksheet XML stream in fixed-size chunks for '<f' or '<prefix:f'
+    formula tags without building an XML DOM.
     """
     overlap = b""
     with zin.open(zip_path, "r") as f:
@@ -84,6 +83,11 @@ def zip_entry_contains_formulas(
             if not chunk:
                 return False
             buf = overlap + chunk
-            if b"<f>" in buf or b"<f " in buf:
+            if (
+                b"<f>" in buf
+                or b"<f " in buf
+                or b":f>" in buf
+                or b":f " in buf
+            ):
                 return True
-            overlap = buf[-4:]
+            overlap = buf[-8:]
