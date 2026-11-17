@@ -37,27 +37,9 @@ def stream_zip_entry(
     src_info: zipfile.ZipInfo,
     chunk_size: int,
 ) -> None:
-    """
-    Copies an untouched zip entry by transferring its raw compressed stream
-    directly (avoiding CPU-heavy decompression and re-deflation).
-    Falls back to standard decompressed copy for encrypted entries.
-    """
-    if src_info.flag_bits & 0x1:
-        dst_info = clone_zip_info(src_info)
-        with zin.open(src_info, "r") as src_f, zout.open(dst_info, "w") as dst_f:
-            shutil.copyfileobj(src_f, dst_f, length=chunk_size)
-        return
-
-    raw_info = clone_zip_info(src_info)
-    raw_info.CRC = src_info.CRC
-    raw_info.compress_size = src_info.compress_size
-    raw_info.file_size = src_info.file_size
-    raw_info.flag_bits = src_info.flag_bits & ~0x8  # Clear data-descriptor bit
-
-    with (
-        zin.open(src_info, "r", raw=True) as src_f,
-        zout.open(raw_info, "w", raw=True) as dst_f,
-    ):
+    dst_info = clone_zip_info(src_info)
+    dst_info._compresslevel = 1
+    with zin.open(src_info, "r") as src_f, zout.open(dst_info, "w") as dst_f:
         shutil.copyfileobj(src_f, dst_f, length=chunk_size)
 
 
@@ -70,8 +52,10 @@ def copy_disk_file_to_zip(
 ) -> None:
     """Streams a temporary XML file from disk into the zip archive."""
     dst_info = clone_zip_info(target_info)
+    if compresslevel is not None:
+        dst_info._compresslevel = compresslevel
     with (
         open(disk_path, "rb") as src_f,
-        zout.open(dst_info, "w", compresslevel=compresslevel) as dst_f,
+        zout.open(dst_info, "w") as dst_f,
     ):
         shutil.copyfileobj(src_f, dst_f, length=chunk_size)
