@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wixlf"
-version = "0.2.0"
+version = "0.3.0"
 description = "Write Into XLSX Files — constant-memory, multiprocess streaming writer for existing .xlsx/.xlsm workbooks."
 readme = "README.md"
 license = "MIT"

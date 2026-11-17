@@ -1,8 +1,9 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .constants import CellScalar
 from .utils.coords import parse_coord
+from .utils.shifting import AxisShiftOp
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,7 @@ class CellEdit:
     value: CellScalar
     style_id: str | None = None  # Optional explicit 's' attribute override
     clear_style: bool = False
+    drop_cell: bool = False  # If True, omits <c> completely from the XML
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +46,7 @@ class SheetEditPlan:
     rows: tuple[RowEditBatch, ...]  # Strictly sorted by row ascending
 
     @classmethod
-    def empty(cls) -> SheetEditPlan:
+    def empty(cls) -> "SheetEditPlan":
         """Returns an empty edit plan (used when creating a blank worksheet)."""
         return cls(rows=())
 
@@ -53,7 +55,7 @@ class SheetEditPlan:
         cls,
         cell_map: Mapping[str | tuple[int, int], CellScalar],
         styles: Mapping[str | tuple[int, int], str] | None = None,
-    ) -> SheetEditPlan:
+    ) -> "SheetEditPlan":
         """
         Compiles an unsorted mapping like {'B5': 42, (1, 1): 'Title'} into a
         strictly sorted SheetEditPlan ready for single-pass streaming.
@@ -108,3 +110,37 @@ class SheetMoveSpec:
 
     name: str
     position: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SheetStructureMutation:
+    """
+    Describes row/column insertions and deletions on a specific worksheet, plus
+    workbook-wide formula shift context so cross-sheet formulas update cleanly.
+    """
+
+    sheet_name: str
+    row_ops: tuple[AxisShiftOp, ...] = ()
+    col_ops: tuple[AxisShiftOp, ...] = ()
+    all_shifts: Mapping[str, tuple[Sequence[AxisShiftOp], Sequence[AxisShiftOp]]] | None = None
+    deleted_sheets: tuple[str, ...] = ()
+
+    @property
+    def has_local_shifts(self) -> bool:
+        return bool(self.row_ops or self.col_ops)
+
+    @property
+    def has_any_shifts(self) -> bool:
+        if self.has_local_shifts or self.deleted_sheets:
+            return True
+        if self.all_shifts:
+            return any(bool(r or c) for r, c in self.all_shifts.values())
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class WorksheetTaskPayload:
+    """Picklable payload passed to sheet worker processes."""
+
+    plan: SheetEditPlan
+    mutation: SheetStructureMutation | None = None

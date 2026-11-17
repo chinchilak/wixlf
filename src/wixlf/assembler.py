@@ -18,12 +18,23 @@ from .constants import (
     NS_MAIN,
     NS_REL_DOC,
     NS_REL_PKG,
+    TABLE_REL_TYPE,
+    TAG_AUTO_FILTER,
+    TAG_DEFINED_NAME,
+    TAG_DEFINED_NAMES,
     WORKSHEET_CT,
     WORKSHEET_REL_TYPE,
     PatchWorkerFn,
 )
-from .models import NewSheetSpec, SheetMoveSpec
+from .models import (
+    NewSheetSpec,
+    SheetEditPlan,
+    SheetMoveSpec,
+    SheetStructureMutation,
+    WorksheetTaskPayload,
+)
 from .patcher import create_sheet_worker
+from .utils.shifting import AxisShiftOp, rewrite_formula, shift_range_str
 from .utils.zip_io import (
     clone_zip_info,
     copy_disk_file_to_zip,
@@ -70,8 +81,9 @@ def _worker_entrypoint(
 class PackageAssembler:
     """
     Coordinates multiprocessing across dirty and newly created sheets, performs
-    sheet structural operations (create, delete, reorder), and atomically writes
-    the resulting .xlsx/.xlsm archive (in-place by default, or to dst_path).
+    sheet structural operations (create, delete, reorder, row/col shifting,
+    Excel Table resizing, and formula rewriting), and atomically writes the
+    resulting .xlsx/.xlsm archive (in-place by default, or to dst_path).
     """
 
     # Avoid process spawn overhead when modifying a single tiny worksheet (< 512 KB)
@@ -83,11 +95,13 @@ class PackageAssembler:
         dst_path: str | Path | None = None,
         max_workers: int | None = None,
         chunk_size: int = 1024 * 1024,  # 1 MB streaming buffer
+        compresslevel: int = 1,
     ) -> None:
         self.src_path = Path(src_path)
         self.dst_path = Path(dst_path) if dst_path is not None else self.src_path
         self.max_workers = max_workers or os.process_cpu_count() or 1
         self.chunk_size = chunk_size
+        self.compresslevel = compresslevel
 
     def build(
         self,
@@ -97,32 +111,78 @@ class PackageAssembler:
         new_sheets: Sequence[NewSheetSpec] = (),
         delete_sheets: Iterable[str] = (),
         move_sheets: Sequence[SheetMoveSpec] = (),
+        shift_ops: Mapping[str, tuple[Sequence[AxisShiftOp], Sequence[AxisShiftOp]]] | None = None,
         force_recalc: bool = True,
     ) -> None:
         """
-        Applies cell edits and worksheet structural mutations atomically.
+        Applies cell edits, row/column shifts, table resizes, formula rewrites,
+        and worksheet structural mutations atomically.
         """
         dirty_map = dict(dirty_edits) if dirty_edits else {}
         delete_set = set(delete_sheets)
+        normalized_shifts: dict[str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]] = {
+            s_name: (tuple(r_ops), tuple(c_ops))
+            for s_name, (r_ops, c_ops) in (shift_ops or {}).items()
+            if r_ops or c_ops
+        }
 
-        if not dirty_map and not new_sheets and not delete_set and not move_sheets:
+        if (
+            not dirty_map
+            and not new_sheets
+            and not delete_set
+            and not move_sheets
+            and not normalized_shifts
+        ):
             if self.src_path.resolve() != self.dst_path.resolve():
                 shutil.copy2(self.src_path, self.dst_path)
             return
 
         with tempfile.TemporaryDirectory(prefix="xlsx_build_") as temp_dir:
-            allocated_new, deleted_zip_paths = self._plan_workbook_mutations(
+            (
+                allocated_new,
+                deleted_zip_paths,
+                surviving_sheets,
+                table_shifts_by_zip,
+                deleted_table_zips,
+            ) = self._plan_workbook_mutations(
                 new_sheets=new_sheets,
                 delete_set=delete_set,
                 move_sheets=move_sheets,
+                shift_ops=normalized_shifts,
             )
 
             # Exclude any sheets scheduled for deletion from patching
-            effective_dirty = {
+            effective_dirty: dict[str, Any] = {
                 path: edits
                 for path, edits in dirty_map.items()
                 if path not in deleted_zip_paths
             }
+
+            # When rows/cols shift or sheets are deleted, formulas across any
+            # surviving worksheet may reference shifted coordinates -> stream all
+            # surviving sheets through SheetStreamPatcher with shift payloads.
+            has_global_formula_shifts = bool(normalized_shifts or delete_set)
+            if has_global_formula_shifts:
+                deleted_tuple = tuple(sorted(delete_set))
+                for s_name, s_zip_path in surviving_sheets.items():
+                    r_ops, c_ops = normalized_shifts.get(s_name, ((), ()))
+                    mutation = SheetStructureMutation(
+                        sheet_name=s_name,
+                        row_ops=r_ops,
+                        col_ops=c_ops,
+                        all_shifts=normalized_shifts,
+                        deleted_sheets=deleted_tuple,
+                    )
+                    existing_item = effective_dirty.get(s_zip_path)
+                    plan = (
+                        existing_item.plan
+                        if isinstance(existing_item, WorksheetTaskPayload)
+                        else (existing_item or SheetEditPlan.empty())
+                    )
+                    effective_dirty[s_zip_path] = WorksheetTaskPayload(
+                        plan=plan,
+                        mutation=mutation,
+                    )
 
             patched_files = self._run_sheet_workers(
                 dirty_edits=effective_dirty,
@@ -136,8 +196,11 @@ class PackageAssembler:
                 patched_files=patched_files,
                 allocated_new=allocated_new,
                 deleted_zip_paths=deleted_zip_paths,
+                deleted_table_zips=deleted_table_zips,
+                table_shifts_by_zip=table_shifts_by_zip,
                 delete_sheet_names=delete_set,
                 move_sheets=move_sheets,
+                shift_ops=normalized_shifts,
                 strip_calc_chain=force_recalc,
             )
 
@@ -146,9 +209,17 @@ class PackageAssembler:
         new_sheets: Sequence[NewSheetSpec],
         delete_set: set[str],
         move_sheets: Sequence[SheetMoveSpec],
-    ) -> tuple[list[_AllocatedNewSheet], set[str]]:
+        shift_ops: Mapping[str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]],
+    ) -> tuple[
+        list[_AllocatedNewSheet],
+        set[str],
+        dict[str, str],
+        dict[str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]],
+        set[str],
+    ]:
         """
-        Validates sheet operations and allocates non-conflicting sheetN.xml paths,
+        Validates sheet operations, resolves Excel Table (xl/tables/tableN.xml)
+        targets for shifted sheets, and allocates non-conflicting sheetN.xml paths,
         sheetId integers, and rId strings for new worksheets.
         """
         with zipfile.ZipFile(self.src_path, "r") as zin:
@@ -156,39 +227,74 @@ class PackageAssembler:
             wb_rels_root = etree.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
             wb_root = etree.fromstring(zin.read("xl/workbook.xml"))
 
-        rel_map: dict[str, str] = {
-            rel_id: target
-            for rel in wb_rels_root.findall(f"{{{NS_REL_PKG}}}Relationship")
-            if (rel_id := rel.get("Id")) and (target := rel.get("Target"))
-        }
+            rel_map: dict[str, str] = {
+                rel_id: target
+                for rel in wb_rels_root.findall(f"{{{NS_REL_PKG}}}Relationship")
+                if (rel_id := rel.get("Id")) and (target := rel.get("Target"))
+            }
 
-        existing_sheets_by_name: dict[str, tuple[int, str]] = {}
-        max_sheet_id = 0
-        for sheet_elem in wb_root.findall(f".//{{{NS_MAIN}}}sheet"):
-            name = sheet_elem.get("name", "")
-            sid_str = sheet_elem.get("sheetId", "0")
-            rid = sheet_elem.get(f"{{{NS_REL_DOC}}}id", "")
-            if sid_str.isdigit():
-                max_sheet_id = max(max_sheet_id, int(sid_str))
-            if name and rid in rel_map:
-                zip_path = resolve_zip_path("xl/workbook.xml", rel_map[rid])
-                existing_sheets_by_name[name] = (int(sid_str or 0), zip_path)
+            existing_sheets_by_name: dict[str, tuple[int, str]] = {}
+            max_sheet_id = 0
+            for sheet_elem in wb_root.findall(f".//{{{NS_MAIN}}}sheet"):
+                name = sheet_elem.get("name", "")
+                sid_str = sheet_elem.get("sheetId", "0")
+                rid = sheet_elem.get(f"{{{NS_REL_DOC}}}id", "")
+                if sid_str.isdigit():
+                    max_sheet_id = max(max_sheet_id, int(sid_str))
+                if name and rid in rel_map:
+                    zip_path = resolve_zip_path("xl/workbook.xml", rel_map[rid])
+                    existing_sheets_by_name[name] = (int(sid_str or 0), zip_path)
 
-        # Validate deletions
-        unknown_deletes = delete_set - existing_sheets_by_name.keys()
-        if unknown_deletes:
-            raise KeyError(f"Cannot delete unknown worksheet(s): {sorted(unknown_deletes)}")
+            # Validate deletions
+            unknown_deletes = delete_set - existing_sheets_by_name.keys()
+            if unknown_deletes:
+                raise KeyError(
+                    f"Cannot delete unknown worksheet(s): {sorted(unknown_deletes)}"
+                )
 
-        remaining_count = len(existing_sheets_by_name) - len(delete_set) + len(new_sheets)
-        if remaining_count < 1:
-            raise ValueError("Workbook must retain at least one visible worksheet.")
+            remaining_count = (
+                len(existing_sheets_by_name) - len(delete_set) + len(new_sheets)
+            )
+            if remaining_count < 1:
+                raise ValueError("Workbook must retain at least one visible worksheet.")
 
-        deleted_zip_paths = {
-            existing_sheets_by_name[name][1] for name in delete_set
-        }
+            deleted_zip_paths = {
+                existing_sheets_by_name[name][1] for name in delete_set
+            }
+            surviving_sheets = {
+                name: info[1]
+                for name, info in existing_sheets_by_name.items()
+                if name not in delete_set
+            }
+
+            # Validate shift targets
+            unknown_shifts = set(shift_ops.keys()) - set(existing_sheets_by_name.keys())
+            if unknown_shifts:
+                raise KeyError(
+                    f"Cannot shift rows/cols on unknown worksheet(s): {sorted(unknown_shifts)}"
+                )
+
+            # Map Excel Tables (xl/tables/tableN.xml) belonging to deleted or shifted sheets
+            table_shifts_by_zip: dict[
+                str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]
+            ] = {}
+            deleted_table_zips: set[str] = set()
+
+            for s_name, (_, s_zip_path) in existing_sheets_by_name.items():
+                s_rels_path = self._rels_path_for_sheet(s_zip_path)
+                if s_rels_path not in existing_entries:
+                    continue
+                s_rels_root = etree.fromstring(zin.read(s_rels_path))
+                for rel in s_rels_root.findall(f"{{{NS_REL_PKG}}}Relationship"):
+                    if rel.get("Type") == TABLE_REL_TYPE and (t := rel.get("Target")):
+                        table_zip = resolve_zip_path(s_zip_path, t)
+                        if s_name in delete_set:
+                            deleted_table_zips.add(table_zip)
+                        elif s_name in shift_ops:
+                            table_shifts_by_zip[table_zip] = shift_ops[s_name]
 
         # Validate new sheet names against surviving + newly added names
-        surviving_names = set(existing_sheets_by_name.keys()) - delete_set
+        surviving_names = set(surviving_sheets.keys())
         seen_new_names: set[str] = set()
         for spec in new_sheets:
             if not spec.name:
@@ -234,7 +340,13 @@ class PackageAssembler:
             )
             next_sheet_id += 1
 
-        return allocated, deleted_zip_paths
+        return (
+            allocated,
+            deleted_zip_paths,
+            surviving_sheets,
+            table_shifts_by_zip,
+            deleted_table_zips,
+        )
 
     def _run_sheet_workers(
         self,
@@ -304,11 +416,20 @@ class PackageAssembler:
         patched_files: Mapping[str, str],
         allocated_new: Sequence[_AllocatedNewSheet],
         deleted_zip_paths: set[str],
+        deleted_table_zips: set[str],
+        table_shifts_by_zip: Mapping[
+            str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]
+        ],
         delete_sheet_names: set[str],
         move_sheets: Sequence[SheetMoveSpec],
+        shift_ops: Mapping[str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]],
         strip_calc_chain: bool,
     ) -> None:
-        """Streams entries into the destination archive without buffering whole files."""
+        """
+        Streams entries into the destination archive without buffering whole files.
+        Untouched archive members are copied as raw compressed streams without
+        decompression/recompression overhead.
+        """
         dst_dir = self.dst_path.parent
         dst_dir.mkdir(parents=True, exist_ok=True)
         fd, staging_zip = tempfile.mkstemp(
@@ -319,12 +440,16 @@ class PackageAssembler:
         deleted_rels_paths = {
             self._rels_path_for_sheet(p) for p in deleted_zip_paths
         }
+        all_deleted_parts = deleted_zip_paths | deleted_table_zips
 
         try:
             with (
                 zipfile.ZipFile(self.src_path, "r") as zin,
                 zipfile.ZipFile(
-                    staging_zip, "w", compression=zipfile.ZIP_DEFLATED
+                    staging_zip,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=self.compresslevel,
                 ) as zout,
             ):
                 for info in zin.infolist():
@@ -333,12 +458,28 @@ class PackageAssembler:
                     if strip_calc_chain and name == CALC_CHAIN_PATH:
                         continue
 
-                    if name in deleted_zip_paths or name in deleted_rels_paths:
+                    if name in all_deleted_parts or name in deleted_rels_paths:
                         continue
 
                     if name in patched_files:
                         copy_disk_file_to_zip(
-                            zout, info, patched_files[name], self.chunk_size
+                            zout,
+                            info,
+                            patched_files[name],
+                            self.chunk_size,
+                            compresslevel=self.compresslevel,
+                        )
+                        continue
+
+                    if name in table_shifts_by_zip:
+                        r_ops, c_ops = table_shifts_by_zip[name]
+                        updated_table = self._update_table_xml(
+                            zin.read(name), r_ops, c_ops
+                        )
+                        zout.writestr(
+                            clone_zip_info(info),
+                            updated_table,
+                            compresslevel=self.compresslevel,
                         )
                         continue
 
@@ -346,10 +487,14 @@ class PackageAssembler:
                         updated_ct = self._update_content_types(
                             zin.read(name),
                             allocated_new=allocated_new,
-                            deleted_zip_paths=deleted_zip_paths,
+                            deleted_zip_paths=all_deleted_parts,
                             strip_calc_chain=strip_calc_chain,
                         )
-                        zout.writestr(clone_zip_info(info), updated_ct)
+                        zout.writestr(
+                            clone_zip_info(info),
+                            updated_ct,
+                            compresslevel=self.compresslevel,
+                        )
                         continue
 
                     if name == "xl/_rels/workbook.xml.rels":
@@ -359,7 +504,11 @@ class PackageAssembler:
                             deleted_zip_paths=deleted_zip_paths,
                             strip_calc_chain=strip_calc_chain,
                         )
-                        zout.writestr(clone_zip_info(info), updated_rels)
+                        zout.writestr(
+                            clone_zip_info(info),
+                            updated_rels,
+                            compresslevel=self.compresslevel,
+                        )
                         continue
 
                     if name == "xl/workbook.xml":
@@ -368,9 +517,14 @@ class PackageAssembler:
                             allocated_new=allocated_new,
                             delete_sheet_names=delete_sheet_names,
                             move_sheets=move_sheets,
+                            shift_ops=shift_ops,
                             force_recalc=strip_calc_chain,
                         )
-                        zout.writestr(clone_zip_info(info), updated_wb)
+                        zout.writestr(
+                            clone_zip_info(info),
+                            updated_wb,
+                            compresslevel=self.compresslevel,
+                        )
                         continue
 
                     stream_zip_entry(zin, zout, info, self.chunk_size)
@@ -379,7 +533,11 @@ class PackageAssembler:
                 for alloc in allocated_new:
                     disk_path = patched_files[alloc.zip_path]
                     copy_disk_file_to_zip(
-                        zout, new_zip_info(alloc.zip_path), disk_path, self.chunk_size
+                        zout,
+                        new_zip_info(alloc.zip_path),
+                        disk_path,
+                        self.chunk_size,
+                        compresslevel=self.compresslevel,
                     )
 
             os.replace(staging_zip, self.dst_path)
@@ -393,6 +551,32 @@ class PackageAssembler:
         """Converts 'xl/worksheets/sheet1.xml' -> 'xl/worksheets/_rels/sheet1.xml.rels'."""
         prefix, _, filename = sheet_zip_path.rpartition("/")
         return f"{prefix}/_rels/{filename}.rels" if prefix else f"_rels/{filename}.rels"
+
+    @staticmethod
+    def _update_table_xml(
+        xml_bytes: bytes,
+        row_ops: Sequence[AxisShiftOp],
+        col_ops: Sequence[AxisShiftOp],
+    ) -> bytes:
+        """Resizes <table ref="..."> and nested <autoFilter ref="..."> on tableN.xml."""
+        root = etree.fromstring(xml_bytes)
+        ref = root.get("ref", "")
+        if ref:
+            new_ref = shift_range_str(ref, row_ops, col_ops)
+            if new_ref is not None:
+                root.set("ref", new_ref)
+
+        af = root.find(TAG_AUTO_FILTER)
+        if af is not None:
+            af_ref = af.get("ref", "")
+            if af_ref:
+                new_af = shift_range_str(af_ref, row_ops, col_ops)
+                if new_af is not None:
+                    af.set("ref", new_af)
+
+        return etree.tostring(
+            root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
 
     @staticmethod
     def _update_content_types(
@@ -462,6 +646,7 @@ class PackageAssembler:
         allocated_new: Sequence[_AllocatedNewSheet],
         delete_sheet_names: set[str],
         move_sheets: Sequence[SheetMoveSpec],
+        shift_ops: Mapping[str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]],
         force_recalc: bool,
     ) -> bytes:
         root = etree.fromstring(xml_bytes)
@@ -508,6 +693,25 @@ class PackageAssembler:
 
         # Replace <sheets> children in final tab order
         sheets_elem[:] = sheet_nodes
+
+        # 4. Update <definedNames> formulas if any rows/cols shifted or sheets deleted
+        if shift_ops or delete_sheet_names:
+            defined_names = root.find(TAG_DEFINED_NAMES)
+            if defined_names is not None:
+                for dn in list(defined_names.findall(TAG_DEFINED_NAME)):
+                    if dn.text:
+                        local_idx = dn.get("localSheetId")
+                        cur_sheet = ""
+                        if local_idx is not None and local_idx.isdigit():
+                            idx_val = int(local_idx)
+                            if 0 <= idx_val < len(sheet_nodes):
+                                cur_sheet = sheet_nodes[idx_val].get("name", "")
+                        dn.text = rewrite_formula(
+                            dn.text,
+                            current_sheet=cur_sheet,
+                            shifts_by_sheet=shift_ops,
+                            deleted_sheets=delete_sheet_names,
+                        )
 
         # Reset activeTab in <bookViews>/<workbookView> so it stays within bounds
         wb_view = root.find(f".//{{{NS_MAIN}}}workbookView")
