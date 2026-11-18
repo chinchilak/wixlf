@@ -379,9 +379,3 @@ def clear_cells(
         max_workers=max_workers,
         compresslevel=compresslevel,
     )
-        src_path=src_path,
-        edits_by_sheet={sheet: SheetEditPlan(rows=batches)},
-        dst_path=dst_path,
-        max_workers=max_workers,
-        compresslevel=compresslevel,
-    )

@@ -144,7 +144,6 @@ class SheetStreamPatcher:
         ws_nsmap = dict(root_elem.nsmap)
 
         row_ops = mutation.row_ops if mutation else ()
-        col_ops = mutation.col_ops if mutation else ()
         has_any_shifts = mutation.has_any_shifts if mutation else False
 
         with xf.element(TAG_WORKSHEET, attrib=ws_attrib, nsmap=ws_nsmap):
