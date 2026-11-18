@@ -8,6 +8,7 @@ from .coords import (
     parse_coord_anchored,
     parse_range,
 )
+from .names import validate_sheet_name
 from .shifting import (
     AxisShiftOp,
     rewrite_formula,
@@ -16,7 +17,7 @@ from .shifting import (
     shift_range_str,
     shift_sqref,
 )
-from .xml_text import sanitize_xml_text, to_excel_serial
+from .xml_text import parse_xml, reject_doctype, sanitize_xml_text, to_excel_serial
 from .zip_io import (
     clone_zip_info,
     copy_disk_file_to_zip,
@@ -39,6 +40,8 @@ __all__ = [
     "parse_coord",
     "parse_coord_anchored",
     "parse_range",
+    "parse_xml",
+    "reject_doctype",
     "resolve_zip_path",
     "rewrite_formula",
     "sanitize_xml_text",
@@ -48,5 +51,6 @@ __all__ = [
     "shift_sqref",
     "stream_zip_entry",
     "to_excel_serial",
+    "validate_sheet_name",
     "zip_entry_contains_formulas",
 ]

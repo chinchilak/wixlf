@@ -13,7 +13,7 @@ A high-performance, constant-memory Python 3.14+ library for modifying existing 
 * **Zero-Recompression Raw Stream Copy:** Untouched worksheets, `styles.xml`, themes, charts, pivot tables, drawings, media, and VBA macros (`.xlsm`) are copied directly as raw compressed zip payloads (`raw=True`) in 1 MB chunks—eliminating decompression/re-deflation CPU overhead on large files.
 * **Fast Deflate (`compresslevel=1`):** Modified and newly created XML entries default to `compresslevel=1` (configurable up to `9`), accelerating writes while keeping file sizes compact.
 * **Constant $O(1)$ Memory Footprint:** Streams `<worksheet>` XML via `lxml.etree.iterparse` + `lxml.etree.xmlfile` with immediate DOM node pruning (`elem.clear()` and preceding-sibling deletion).
-* **Per-Worksheet Multiprocessing:** Dispatches dirty and newly created worksheets across a `ProcessPoolExecutor` (bypassing the GIL) when handling multiple sheets or sheets $\ge$ 512 KB.
+* **Per-Worksheet Multiprocessing:** Dispatches dirty and newly created worksheets across a `ProcessPoolExecutor` (bypassing the GIL) when 2+ sheets are processed and their combined size is $\ge$ 512 KB (tunable via `PackageAssembler(parallel_threshold_bytes=...)`); smaller jobs run inline.
 * **Pure-Python Utilities (Zero Regex):** Coordinate parsing, formula reference rewriting, and XML 1.0 character sanitization use pure character-by-character scanning and C-level `str.translate()`.
 
 ---
@@ -45,11 +45,11 @@ wixlf.patch_workbook(
             "A1": "Q4 Revenue Report",
             "B2": 149500.75,
             "C2": True,
-            "D2": "=B2*0.21",
+            "D2": wixlf.Formula("=B2*0.21"),
         },
         "Summary": {
             (2, 1): "Total",
-            (2, 2): "=SUM(Sales!B2:B500)",
+            (2, 2): wixlf.Formula("=SUM(Sales!B2:B500)"),
         },
     },
 )
@@ -160,10 +160,13 @@ plan = wixlf.SheetEditPlan.from_dict({
     "F2": date(2026, 11, 17),        # Converted to Excel 1900 serial number
     "G2": datetime(2026, 11, 17, 9, 30),
     "H2": time(9, 30, 0),
-    "I2": "=SUM(C2:D2)",              # Formula (leading '=' stripped for OOXML <f>)
+    "I2": wixlf.Formula("=SUM(C2:D2)"),  # Formula (leading '=' optional)
+    "K2": "=not a formula",          # Plain str is always text (formula-injection safe)
     "J2": None,                      # Clears cell value while keeping cell style
 })
 ```
+
+To restore the legacy behaviour where any `str` starting with `=` is a formula, pass `formulas_from_strings=True` to `patch_workbook()` / `add_sheet()`.
 
 ### Overriding or Clearing Cell Styles
 
@@ -188,6 +191,17 @@ custom_plan = wixlf.SheetEditPlan(
         ),
     )
 )
+```
+
+### Windows / macOS: guard your entry point
+
+Worker processes are started with `spawn`, which re-imports your script. Always call wixlf from behind a main guard:
+
+```python
+import wixlf
+
+if __name__ == "__main__":
+    wixlf.patch_workbook("report.xlsx", {"Sales": {"A1": "Hello"}})
 ```
 
 ---
@@ -219,3 +233,4 @@ src/wixlf/
 
 * **Date Cells Require Existing Date Formatting:** `date` and `datetime` values serialize to Excel serial numbers; the target cell must already have a date number format style (`s`) in the template to render as a date rather than a number.
 * **No New Style Creation:** Can inherit or assign existing `s` style indices from the workbook, but does not author new entries in `xl/styles.xml`.
+* **Cross-Sheet Dependents of Deleted Sheets:** Deleting a worksheet removes its own drawings, comments, tables, and other parts, but pivot tables, pivot caches, or charts on *other* sheets that source data from it are not rewritten; Excel will repair or empty them on open.

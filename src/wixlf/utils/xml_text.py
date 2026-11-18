@@ -1,6 +1,25 @@
 from datetime import date, datetime, time
 from typing import Final
 
+from lxml import etree
+
+_SAFE_PARSER: Final[etree.XMLParser] = etree.XMLParser(
+    resolve_entities=False, no_network=True, load_dtd=False
+)
+
+
+def reject_doctype(root: etree._Element) -> None:
+    """Raises if the document declares a DTD (never present in genuine OOXML parts)."""
+    if root.getroottree().docinfo.doctype:
+        raise ValueError("DTD declarations are not allowed in OOXML parts.")
+
+
+def parse_xml(data: bytes) -> etree._Element:
+    """Parses an OOXML part with entity expansion, network access, and DTDs disabled."""
+    root = etree.fromstring(data, parser=_SAFE_PARSER)
+    reject_doctype(root)
+    return root
+
 # Translation table mapping illegal XML 1.0 characters to None (fast C-level str.translate)
 _ILLEGAL_XML_TRANS: Final[dict[int, None]] = dict.fromkeys(
     [
@@ -42,6 +61,6 @@ def to_excel_serial(dt_val: datetime | date | time) -> float:
         ) / 86400.0
 
     # Adjust for Excel's fictional Feb 29, 1900 (serial 60)
-    if not isinstance(dt_val, time) and serial <= 60:
+    if not isinstance(dt_val, time) and serial < 61:
         serial -= 1.0
     return serial

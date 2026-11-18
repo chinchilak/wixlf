@@ -2,6 +2,33 @@ import posixpath
 import shutil
 import time
 import zipfile
+from pathlib import Path
+from typing import NamedTuple
+
+from ..constants import NS_REL_PKG
+from .xml_text import parse_xml
+
+
+class Relationship(NamedTuple):
+    id: str
+    type: str
+    target: str
+    external: bool
+
+
+def read_relationships(zin: zipfile.ZipFile, rels_path: str) -> list[Relationship]:
+    """Parses a .rels part into Relationship tuples (entries without Id/Target are skipped)."""
+    rels_root = parse_xml(zin.read(rels_path))
+    return [
+        Relationship(
+            id=rel_id,
+            type=rel.get("Type", ""),
+            target=target,
+            external=rel.get("TargetMode") == "External",
+        )
+        for rel in rels_root.findall(f"{{{NS_REL_PKG}}}Relationship")
+        if (rel_id := rel.get("Id")) and (target := rel.get("Target"))
+    ]
 
 
 def resolve_zip_path(base_file: str, target: str) -> str:
@@ -44,8 +71,12 @@ def stream_zip_entry(
     """
     dst_info = clone_zip_info(src_info)
     if compresslevel is not None and dst_info.compress_type == zipfile.ZIP_DEFLATED:
-        dst_info._compresslevel = compresslevel
-    with zin.open(src_info, "r") as src_f, zout.open(dst_info, "w") as dst_f:
+        dst_info.compress_level = compresslevel
+    zip64 = src_info.file_size > zipfile.ZIP64_LIMIT
+    with (
+        zin.open(src_info, "r") as src_f,
+        zout.open(dst_info, "w", force_zip64=zip64) as dst_f,
+    ):
         shutil.copyfileobj(src_f, dst_f, length=chunk_size)
 
 
@@ -59,10 +90,11 @@ def copy_disk_file_to_zip(
     """Streams a temporary XML file from disk into the zip archive."""
     dst_info = clone_zip_info(target_info)
     if compresslevel is not None and dst_info.compress_type == zipfile.ZIP_DEFLATED:
-        dst_info._compresslevel = compresslevel
+        dst_info.compress_level = compresslevel
+    zip64 = Path(disk_path).stat().st_size > zipfile.ZIP64_LIMIT
     with (
         open(disk_path, "rb") as src_f,
-        zout.open(dst_info, "w") as dst_f,
+        zout.open(dst_info, "w", force_zip64=zip64) as dst_f,
     ):
         shutil.copyfileobj(src_f, dst_f, length=chunk_size)
 

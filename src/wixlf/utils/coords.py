@@ -1,3 +1,15 @@
+from ..constants import MAX_EXCEL_COLS, MAX_EXCEL_ROWS
+
+
+def check_cell_bounds(row_idx: int, col_idx: int) -> None:
+    """Raises ValueError if (row_idx, col_idx) lies outside the Excel grid."""
+    if not (1 <= row_idx <= MAX_EXCEL_ROWS and 1 <= col_idx <= MAX_EXCEL_COLS):
+        raise ValueError(
+            f"Cell ({row_idx}, {col_idx}) is outside the Excel grid "
+            f"(1..{MAX_EXCEL_ROWS} rows, 1..{MAX_EXCEL_COLS} cols)."
+        )
+
+
 def col_to_idx(col_str: str) -> int:
     """Converts column letters ('A' -> 1, 'Z' -> 26, 'AA' -> 27) to 1-based index."""
     idx = 0
@@ -63,10 +75,11 @@ def parse_coord_anchored(coord: str) -> tuple[int, int, bool, bool]:
         raise ValueError(f"Invalid Excel cell coordinate: {coord!r}")
 
     row_idx = int(row_part)
-    if row_idx < 1:
+    col_idx = col_to_idx(col_letters)
+    if not (1 <= row_idx <= MAX_EXCEL_ROWS and col_idx <= MAX_EXCEL_COLS):
         raise ValueError(f"Invalid Excel cell coordinate: {coord!r}")
 
-    return row_idx, col_to_idx(col_letters), col_abs, row_abs
+    return row_idx, col_idx, col_abs, row_abs
 
 
 def parse_coord(coord: str) -> tuple[int, int]:

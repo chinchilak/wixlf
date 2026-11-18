@@ -301,7 +301,36 @@ def rewrite_formula(
             out.append(formula[start:i])
             continue
 
-        # 2. Single-quoted sheet prefix: 'Sheet Name'!A1:B2
+        # 2. Bracketed structured ref (Table1[[#This Row],[Col]]) or external book ([1]Sheet1!A1)
+        if ch == "[":
+            start = i
+            depth = 0
+            while i < n:
+                c = formula[i]
+                if c == "'" and i + 1 < n:
+                    i += 2  # ' escapes the next char inside structured refs
+                    continue
+                if c == "[":
+                    depth += 1
+                elif c == "]":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            # External workbook prefix: copy the following Sheet!Ref verbatim too
+            j = i
+            while j < n and (formula[j].isalnum() or formula[j] in ("_", ".")):
+                j += 1
+            if j > i and j < n and formula[j] == "!":
+                j += 1
+                while j < n and (formula[j].isalnum() or formula[j] in ("$", ":")):
+                    j += 1
+                i = j
+            out.append(formula[start:i])
+            continue
+
+        # 3. Single-quoted sheet prefix: 'Sheet Name'!A1:B2
         if ch == "'":
             start = i
             i += 1
@@ -323,7 +352,10 @@ def rewrite_formula(
                 ):
                     i += 1
                 ref_body = formula[ref_start:i]
-                if target_sheet in deleted_set:
+                # Sheet names cannot contain '[', so this is an external workbook ref
+                if "[" in target_sheet:
+                    out.append(f"{raw_prefix}!{ref_body}")
+                elif target_sheet in deleted_set:
                     out.append("#REF!")
                 elif target_sheet in shifts_by_sheet:
                     r_ops, c_ops = shifts_by_sheet[target_sheet]
@@ -338,7 +370,7 @@ def rewrite_formula(
                 out.append(formula[start:i])
             continue
 
-        # 3. Unquoted identifier, sheet-qualified ref (Sheet2!A1), or local ref (A1:B5)
+        # 4. Unquoted identifier, sheet-qualified ref (Sheet2!A1), or local ref (A1:B5)
         if ch.isalpha() or ch in ("$", "_"):
             # Do not treat suffix after '.' (e.g. Table1.Column) as a cell coord
             if i > 0 and formula[i - 1] == ".":
@@ -388,7 +420,7 @@ def rewrite_formula(
                 out.append(token)
             continue
 
-        # 4. Pure numeric or row-range token (e.g. 2:10)
+        # 5. Pure numeric or row-range token (e.g. 2:10)
         if ch.isdigit():
             start = i
             while i < n and (formula[i].isdigit() or formula[i] in (".", ":", "$")):

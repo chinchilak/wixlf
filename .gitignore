@@ -2,3 +2,4 @@
 .vscode
 *.xl*
 test.py
+.github/skills/*

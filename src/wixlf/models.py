@@ -2,8 +2,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .constants import CellScalar
-from .utils.coords import parse_coord
+from .utils.coords import check_cell_bounds, parse_coord
 from .utils.shifting import AxisShiftOp
+
+
+@dataclass(frozen=True, slots=True)
+class Formula:
+    """Explicit Excel formula cell value; plain strings are always written as text."""
+
+    text: str  # Leading '=' is optional
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +21,7 @@ class SheetInfo:
     sheet_id: str
     rel_id: str
     zip_path: str  # e.g., "xl/worksheets/sheet1.xml"
+    state: str = "visible"  # "visible" | "hidden" | "veryHidden"
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +45,18 @@ class RowEditBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class ClearRangeSpec:
+    """Inclusive rectangle whose existing cells are cleared while streaming (no empty cells created)."""
+
+    min_row: int
+    min_col: int
+    max_row: int
+    max_col: int
+    clear_style: bool = False
+    drop_cell: bool = False  # If True, removes matching <c> elements entirely
+
+
+@dataclass(frozen=True, slots=True)
 class SheetEditPlan:
     """
     Pre-sorted, immutable, picklable edit plan for a single worksheet.
@@ -44,6 +64,7 @@ class SheetEditPlan:
     """
 
     rows: tuple[RowEditBatch, ...]  # Strictly sorted by row ascending
+    clear_ranges: tuple[ClearRangeSpec, ...] = ()  # Applied before row edits
 
     @classmethod
     def empty(cls) -> "SheetEditPlan":
@@ -70,8 +91,7 @@ class SheetEditPlan:
 
         for key, val in cell_map.items():
             r, c = parse_coord(key) if isinstance(key, str) else key
-            if r < 1 or c < 1:
-                raise ValueError(f"Row and column must be >= 1, got ({r}, {c})")
+            check_cell_bounds(r, c)
             by_row.setdefault(r, {})[c] = CellEdit(
                 row=r,
                 col=c,

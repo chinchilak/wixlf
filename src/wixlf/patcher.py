@@ -7,29 +7,48 @@ from lxml import etree
 
 from .constants import (
     MAX_EXCEL_COLS,
+    MAX_EXCEL_ROWS,
     NS_MAIN,
     NS_REL_DOC,
     NS_XML,
     TAG_AUTO_FILTER,
+    TAG_BRK,
     TAG_CELL,
+    TAG_CF_FORMULA,
     TAG_COL,
+    TAG_COL_BREAKS,
     TAG_COLS,
     TAG_COND_FMT,
     TAG_DATA_VAL,
     TAG_DATA_VALS,
     TAG_DIMENSION,
+    TAG_DV_FORMULA1,
+    TAG_DV_FORMULA2,
     TAG_FORMULA,
+    TAG_HYPERLINK,
+    TAG_HYPERLINKS,
+    TAG_IGNORED_ERROR,
+    TAG_IGNORED_ERRORS,
     TAG_INLINE_STR,
     TAG_MERGE_CELL,
     TAG_MERGE_CELLS,
+    TAG_PANE,
+    TAG_PROTECTED_RANGE,
+    TAG_PROTECTED_RANGES,
     TAG_ROW,
+    TAG_ROW_BREAKS,
+    TAG_SELECTION,
     TAG_SHEET_DATA,
+    TAG_SHEET_VIEW,
+    TAG_SHEET_VIEWS,
     TAG_TEXT,
     TAG_VALUE,
     TAG_WORKSHEET,
 )
 from .models import (
     CellEdit,
+    ClearRangeSpec,
+    Formula,
     RowEditBatch,
     SheetEditPlan,
     SheetStructureMutation,
@@ -43,7 +62,7 @@ from .utils.shifting import (
     shift_range_str,
     shift_sqref,
 )
-from .utils.xml_text import sanitize_xml_text, to_excel_serial
+from .utils.xml_text import reject_doctype, sanitize_xml_text, to_excel_serial
 
 
 class SheetStreamPatcher:
@@ -79,7 +98,7 @@ class SheetStreamPatcher:
             etree.xmlfile(out_xml_path, encoding="utf-8") as xf,
         ):
             xf.write_declaration(standalone=True)
-            self._stream_transform(xml_in, xf, plan.rows, mutation)
+            self._stream_transform(xml_in, xf, plan.rows, mutation, plan.clear_ranges)
 
     def write_new_sheet(
         self,
@@ -95,7 +114,7 @@ class SheetStreamPatcher:
                 xf.element(TAG_SHEET_DATA),
             ):
                 for batch in plan.rows:
-                    self._write_new_row(xf, batch, mutation=None)
+                    self._write_new_row(xf, batch)
 
     def _stream_transform(
         self,
@@ -103,16 +122,21 @@ class SheetStreamPatcher:
         xf: etree.xmlfile,
         row_batches: Sequence[RowEditBatch],
         mutation: SheetStructureMutation | None,
+        clear_ranges: Sequence[ClearRangeSpec] = (),
     ) -> None:
         context = etree.iterparse(
             xml_in,
             events=("start", "end"),
             recover=False,
             huge_tree=True,
+            resolve_entities=False,
+            no_network=True,
+            load_dtd=False,
         )
 
         # Peek at root <worksheet> start event to preserve exact namespaces/attrs
         event, root_elem = next(context)
+        reject_doctype(root_elem)
         if event != "start" or root_elem.tag != TAG_WORKSHEET:
             raise ValueError(f"Expected <worksheet> root, got {root_elem.tag}")
 
@@ -121,7 +145,6 @@ class SheetStreamPatcher:
 
         row_ops = mutation.row_ops if mutation else ()
         col_ops = mutation.col_ops if mutation else ()
-        has_local_shifts = bool(row_ops or col_ops)
         has_any_shifts = mutation.has_any_shifts if mutation else False
 
         with xf.element(TAG_WORKSHEET, attrib=ws_attrib, nsmap=ws_nsmap):
@@ -129,6 +152,10 @@ class SheetStreamPatcher:
             sheet_data_written = False
             batch_idx = 0
             total_batches = len(row_batches)
+            last_row = 0
+            pending_clears = sorted(clear_ranges, key=lambda c: c.min_row)
+            clear_idx = 0
+            active_clears: list[ClearRangeSpec] = []
 
             for event, elem in context:
                 tag = elem.tag
@@ -145,7 +172,7 @@ class SheetStreamPatcher:
                 if event == "end" and tag == TAG_SHEET_DATA:
                     # Flush any remaining new rows that belong after the last existing row
                     while batch_idx < total_batches:
-                        self._write_new_row(xf, row_batches[batch_idx], mutation)
+                        self._write_new_row(xf, row_batches[batch_idx])
                         batch_idx += 1
 
                     sd_ctx.__exit__(None, None, None)
@@ -156,7 +183,14 @@ class SheetStreamPatcher:
                 # Inside <sheetData>: shift coordinates & merge-join sorted cell edits
                 if in_sheet_data:
                     if event == "end" and tag == TAG_ROW:
-                        raw_row_num = int(elem.get("r", "0"))
+                        # r is optional in OOXML; an omitted r implies previous row + 1
+                        raw_r = elem.get("r")
+                        raw_row_num = int(raw_r) if raw_r is not None else last_row + 1
+                        last_row = raw_row_num
+                        if raw_r is None:
+                            elem.set("r", str(raw_row_num))
+                        self._resolve_cell_columns(elem, raw_row_num)
+
                         target_row = (
                             shift_index(raw_row_num, row_ops)
                             if row_ops
@@ -168,16 +202,40 @@ class SheetStreamPatcher:
                             self._prune_element(elem)
                             continue
 
+                        if target_row > MAX_EXCEL_ROWS:
+                            if len(elem) > 0:
+                                raise ValueError(
+                                    "Insert would shift non-blank cells off the worksheet "
+                                    f"(row {target_row} > {MAX_EXCEL_ROWS})."
+                                )
+                            # Formatting-only row pushed off the grid -> drop it
+                            self._prune_element(elem)
+                            continue
+
                         # Shift row index, cell columns, and formulas in-place on <row>
                         if has_any_shifts:
                             self._shift_row_in_place(elem, target_row, mutation)
+
+                        # Rows arrive in ascending order, so clear ranges activate/expire monotonically
+                        while (
+                            clear_idx < len(pending_clears)
+                            and pending_clears[clear_idx].min_row <= target_row
+                        ):
+                            active_clears.append(pending_clears[clear_idx])
+                            clear_idx += 1
+                        if active_clears:
+                            active_clears = [
+                                c for c in active_clears if c.max_row >= target_row
+                            ]
+                            if active_clears:
+                                self._clear_row_cells(elem, active_clears)
 
                         # Insert any brand-new rows strictly preceding this row
                         while (
                             batch_idx < total_batches
                             and row_batches[batch_idx].row < target_row
                         ):
-                            self._write_new_row(xf, row_batches[batch_idx], mutation)
+                            self._write_new_row(xf, row_batches[batch_idx])
                             batch_idx += 1
 
                         # Patch existing row if it matches the current edit batch
@@ -185,9 +243,7 @@ class SheetStreamPatcher:
                             batch_idx < total_batches
                             and row_batches[batch_idx].row == target_row
                         ):
-                            self._patch_existing_row(
-                                elem, row_batches[batch_idx], mutation
-                            )
+                            self._patch_existing_row(elem, row_batches[batch_idx])
                             batch_idx += 1
 
                         # Write row only if it still has cells or non-trivial row attrs
@@ -202,7 +258,11 @@ class SheetStreamPatcher:
                         self._prune_element(elem)
                         continue
 
-                    if has_local_shifts and not self._transform_worksheet_metadata(elem, row_ops, col_ops):
+                    if (
+                        has_any_shifts
+                        and mutation is not None
+                        and not self._transform_worksheet_metadata(elem, mutation)
+                    ):
                         self._prune_element(elem)
                         continue
 
@@ -213,9 +273,54 @@ class SheetStreamPatcher:
             if not sheet_data_written and total_batches > 0:
                 with xf.element(TAG_SHEET_DATA):
                     for batch in row_batches:
-                        self._write_new_row(xf, batch, mutation)
+                        self._write_new_row(xf, batch)
 
         root_elem.clear()
+
+    @staticmethod
+    def _clear_row_cells(
+        row_elem: etree._Element,
+        active: Sequence[ClearRangeSpec],
+    ) -> None:
+        """Clears or drops existing cells in this row that fall inside any active clear range."""
+        kept: list[etree._Element] = []
+        for cell in row_elem:
+            if cell.tag != TAG_CELL:
+                kept.append(cell)
+                continue
+            _, col = parse_coord(cell.get("r", ""))
+            spec = next((c for c in active if c.min_col <= col <= c.max_col), None)
+            if spec is None:
+                kept.append(cell)
+                continue
+            if spec.drop_cell:
+                continue
+            for child in list(cell):
+                cell.remove(child)
+            for attr in ("t", "cm", "vm"):
+                cell.attrib.pop(attr, None)
+            if spec.clear_style:
+                cell.attrib.pop("s", None)
+            kept.append(cell)
+        row_elem[:] = kept
+
+    @staticmethod
+    def _resolve_cell_columns(row_elem: etree._Element, row_num: int) -> None:
+        """Sets explicit r= on cells that omit it (implied: previous cell's column + 1)."""
+        prev_col = 0
+        last_explicit: str | None = None
+        for cell in row_elem:
+            if cell.tag != TAG_CELL:
+                continue
+            raw = cell.get("r")
+            if raw is not None:
+                last_explicit = raw  # Parsed lazily so fully-addressed rows pay nothing
+                continue
+            if last_explicit is not None:
+                prev_col = parse_coord(last_explicit)[1]
+                last_explicit = None
+            prev_col += 1
+            cell.set("r", format_coord(row_num, prev_col))
 
     def _shift_row_in_place(
         self,
@@ -235,11 +340,25 @@ class SheetStreamPatcher:
             new_col = shift_index(orig_col, col_ops) if col_ops else orig_col
             if new_col is None:
                 continue  # Cell fell in deleted column span
+            if new_col > MAX_EXCEL_COLS:
+                raise ValueError(
+                    "Insert would shift non-blank cells off the worksheet "
+                    f"(column {new_col} > {MAX_EXCEL_COLS})."
+                )
 
             cell_elem.set("r", format_coord(target_row, new_col))
 
             if mutation and mutation.has_any_shifts:
                 f_elem = cell_elem.find(TAG_FORMULA)
+                if f_elem is not None:
+                    # Shared/array formula masters carry the range they span
+                    f_ref = f_elem.get("ref")
+                    if f_ref and mutation.has_local_shifts:
+                        new_f_ref = shift_range_str(f_ref, mutation.row_ops, col_ops)
+                        if new_f_ref is None:
+                            f_elem.attrib.pop("ref")
+                        else:
+                            f_elem.set("ref", new_f_ref)
                 if f_elem is not None and f_elem.text:
                     f_elem.text = self._rewrite_formula_text(f_elem.text, mutation)
                     # Drop cached formula result <v> so Excel computes fresh value
@@ -255,7 +374,6 @@ class SheetStreamPatcher:
         self,
         row_elem: etree._Element,
         batch: RowEditBatch,
-        mutation: SheetStructureMutation | None,
     ) -> None:
         """
         Merges sorted CellEdits into an existing <row> element in linear time,
@@ -280,20 +398,18 @@ class SheetStreamPatcher:
             elif existing_col > edit.col:
                 if not edit.drop_cell:
                     new_children.append(
-                        self._build_cell_element(
-                            edit, inherited_style=None, mutation=mutation
-                        )
+                        self._build_cell_element(edit, inherited_style=None)
                     )
                 e_idx += 1
             else:
                 # Existing cell matches target column
                 if not edit.drop_cell:
                     inherited_style = cell_elem.get("s")
-                    new_children.append(
-                        self._build_cell_element(
-                            edit, inherited_style=inherited_style, mutation=mutation
-                        )
-                    )
+                    new_cell = self._build_cell_element(edit, inherited_style=inherited_style)
+                    # cm/vm describe the old value (rich data, spills) so they are dropped; ph is display-only
+                    if (ph := cell_elem.get("ph")) is not None:
+                        new_cell.set("ph", ph)
+                    new_children.append(new_cell)
                 c_idx += 1
                 e_idx += 1
 
@@ -304,9 +420,7 @@ class SheetStreamPatcher:
         while e_idx < num_edits:
             edit = batch.cells[e_idx]
             if not edit.drop_cell:
-                new_children.append(
-                    self._build_cell_element(edit, inherited_style=None, mutation=mutation)
-                )
+                new_children.append(self._build_cell_element(edit, inherited_style=None))
             e_idx += 1
 
         # Replace row children in-place while keeping <row> attributes (ht, customHeight, s)
@@ -318,7 +432,6 @@ class SheetStreamPatcher:
         self,
         xf: etree.xmlfile,
         batch: RowEditBatch,
-        mutation: SheetStructureMutation | None,
     ) -> None:
         """Streams a brand-new <row> element directly to xmlfile."""
         cells_to_write = [e for e in batch.cells if not e.drop_cell]
@@ -326,18 +439,15 @@ class SheetStreamPatcher:
             return
         row_elem = etree.Element(TAG_ROW, r=str(batch.row))
         for edit in cells_to_write:
-            row_elem.append(
-                self._build_cell_element(edit, inherited_style=None, mutation=mutation)
-            )
+            row_elem.append(self._build_cell_element(edit, inherited_style=None))
         xf.write(row_elem)
 
     def _build_cell_element(
         self,
         edit: CellEdit,
         inherited_style: str | None,
-        mutation: SheetStructureMutation | None = None,
     ) -> etree._Element:
-        """Constructs a compliant OOXML <c> element for any scalar or formula."""
+        """Constructs a compliant OOXML <c> element; user formulas are written verbatim."""
         coord = format_coord(edit.row, edit.col)
         c_elem = etree.Element(TAG_CELL, r=coord)
 
@@ -378,23 +488,23 @@ class SheetStreamPatcher:
             v_elem.text = repr(to_excel_serial(val))
             return c_elem
 
-        # 5. Formula vs. Inline String
+        # 5. Explicit formula
+        if isinstance(val, Formula):
+            f_elem = etree.SubElement(c_elem, TAG_FORMULA)
+            # OOXML stores formulas without '='
+            f_elem.text = val.text.removeprefix("=")
+            # Omit <v> so Excel computes the fresh result on open
+            return c_elem
+
+        # 6. Inline string (never interpreted as a formula)
         if isinstance(val, str):
-            if val.startswith("="):
-                f_elem = etree.SubElement(c_elem, TAG_FORMULA)
-                formula_body = val[1:]  # OOXML stores formulas without leading '='
-                if mutation and mutation.has_any_shifts:
-                    formula_body = self._rewrite_formula_text(formula_body, mutation)
-                f_elem.text = formula_body
-                # Omit <v> so Excel computes the fresh result on open
-            else:
-                clean_text = sanitize_xml_text(val)
-                c_elem.set("t", "inlineStr")
-                is_elem = etree.SubElement(c_elem, TAG_INLINE_STR)
-                t_elem = etree.SubElement(is_elem, TAG_TEXT)
-                if clean_text != clean_text.strip() or "\n" in clean_text:
-                    t_elem.set(f"{{{NS_XML}}}space", "preserve")
-                t_elem.text = clean_text
+            clean_text = sanitize_xml_text(val)
+            c_elem.set("t", "inlineStr")
+            is_elem = etree.SubElement(c_elem, TAG_INLINE_STR)
+            t_elem = etree.SubElement(is_elem, TAG_TEXT)
+            if clean_text != clean_text.strip() or "\n" in clean_text:
+                t_elem.set(f"{{{NS_XML}}}space", "preserve")
+            t_elem.text = clean_text
             return c_elem
 
         raise TypeError(f"Unsupported cell value type: {type(val).__name__}")
@@ -413,17 +523,55 @@ class SheetStreamPatcher:
             deleted_sheets=mutation.deleted_sheets,
         )
 
-    @staticmethod
     def _transform_worksheet_metadata(
+        self,
         elem: etree._Element,
-        row_ops: Sequence[AxisShiftOp],
-        col_ops: Sequence[AxisShiftOp],
+        mutation: SheetStructureMutation,
     ) -> bool:
         """
-        Shifts worksheet-level coordinate metadata (<cols>, <mergeCells>, <autoFilter>,
-        <conditionalFormatting>, <dataValidations>). Returns False if element becomes empty.
+        Shifts worksheet-level coordinate metadata and rewrites formulas embedded in
+        conditional formatting / data validation. Returns False if element becomes empty.
         """
         tag = elem.tag
+        row_ops = mutation.row_ops
+        col_ops = mutation.col_ops
+        local = mutation.has_local_shifts
+
+        if tag == TAG_COND_FMT:
+            sqref = elem.get("sqref", "")
+            if local and sqref:
+                new_sqref = shift_sqref(sqref, row_ops, col_ops)
+                if not new_sqref:
+                    return False
+                elem.set("sqref", new_sqref)
+            for f_el in elem.iter(TAG_CF_FORMULA):
+                if f_el.text:
+                    f_el.text = self._rewrite_formula_text(f_el.text, mutation)
+            return True
+
+        if tag == TAG_DATA_VALS:
+            kept_dvs: list[etree._Element] = []
+            for dv in list(elem.findall(TAG_DATA_VAL)):
+                sqref = dv.get("sqref", "")
+                if local and sqref:
+                    new_sqref = shift_sqref(sqref, row_ops, col_ops)
+                    if not new_sqref:
+                        continue
+                    dv.set("sqref", new_sqref)
+                for f_tag in (TAG_DV_FORMULA1, TAG_DV_FORMULA2):
+                    f_el = dv.find(f_tag)
+                    if f_el is not None and f_el.text:
+                        f_el.text = self._rewrite_formula_text(f_el.text, mutation)
+                kept_dvs.append(dv)
+            elem[:] = kept_dvs
+            if not kept_dvs:
+                return False
+            elem.set("count", str(len(kept_dvs)))
+            return True
+
+        # Everything below only depends on this sheet's own row/col shifts
+        if not local:
+            return True
 
         if tag == TAG_COLS and col_ops:
             new_cols: list[etree._Element] = []
@@ -478,32 +626,83 @@ class SheetStreamPatcher:
                 elem.set("ref", new_ref)
             return True
 
-        if tag == TAG_COND_FMT:
-            sqref = elem.get("sqref", "")
-            if sqref:
-                new_sqref = shift_sqref(sqref, row_ops, col_ops)
-                if not new_sqref:
-                    return False
-                elem.set("sqref", new_sqref)
+        if tag == TAG_HYPERLINKS:
+            for hl in elem.findall(TAG_HYPERLINK):
+                ref = hl.get("ref", "")
+                new_ref = shift_range_str(ref, row_ops, col_ops) if ref else None
+                if new_ref is None:
+                    elem.remove(hl)
+                else:
+                    hl.set("ref", new_ref)
+            return elem.find(TAG_HYPERLINK) is not None
+
+        if tag == TAG_SHEET_VIEWS:
+            for view_el in elem.iter(TAG_SHEET_VIEW, TAG_PANE):
+                self._shift_cell_attr(view_el, "topLeftCell", row_ops, col_ops)
+            for sel in elem.iter(TAG_SELECTION):
+                self._shift_cell_attr(sel, "activeCell", row_ops, col_ops)
+                sqref = sel.get("sqref")
+                if sqref:
+                    sel.set("sqref", shift_sqref(sqref, row_ops, col_ops) or "A1")
             return True
 
-        if tag == TAG_DATA_VALS:
-            kept_dvs: list[etree._Element] = []
-            for dv in list(elem.findall(TAG_DATA_VAL)):
-                sqref = dv.get("sqref", "")
-                if sqref:
-                    new_sqref = shift_sqref(sqref, row_ops, col_ops)
-                    if not new_sqref:
-                        continue
-                    dv.set("sqref", new_sqref)
-                kept_dvs.append(dv)
-            elem[:] = kept_dvs
-            if not kept_dvs:
+        if tag in (TAG_ROW_BREAKS, TAG_COL_BREAKS):
+            ops = row_ops if tag == TAG_ROW_BREAKS else col_ops
+            if not ops:
+                return True
+            for brk in elem.findall(TAG_BRK):
+                raw_id = brk.get("id", "")
+                if not raw_id.isdigit():
+                    continue
+                new_id = shift_index(int(raw_id), ops)
+                if new_id is None:
+                    elem.remove(brk)
+                else:
+                    brk.set("id", str(new_id))
+            remaining = elem.findall(TAG_BRK)
+            if not remaining:
                 return False
-            elem.set("count", str(len(kept_dvs)))
+            elem.set("count", str(len(remaining)))
+            if "manualBreakCount" in elem.attrib:
+                manual = sum(1 for b in remaining if b.get("man") in ("1", "true"))
+                elem.set("manualBreakCount", str(manual))
             return True
+
+        if tag == TAG_IGNORED_ERRORS:
+            return self._shift_sqref_children(elem, TAG_IGNORED_ERROR, row_ops, col_ops)
+
+        if tag == TAG_PROTECTED_RANGES:
+            return self._shift_sqref_children(elem, TAG_PROTECTED_RANGE, row_ops, col_ops)
 
         return True
+
+    @staticmethod
+    def _shift_cell_attr(
+        el: etree._Element,
+        attr: str,
+        row_ops: Sequence[AxisShiftOp],
+        col_ops: Sequence[AxisShiftOp],
+    ) -> None:
+        """Shifts a single-cell attribute (e.g. topLeftCell), falling back to A1 if deleted."""
+        raw = el.get(attr)
+        if raw:
+            el.set(attr, shift_range_str(raw, row_ops, col_ops) or "A1")
+
+    @staticmethod
+    def _shift_sqref_children(
+        elem: etree._Element,
+        child_tag: str,
+        row_ops: Sequence[AxisShiftOp],
+        col_ops: Sequence[AxisShiftOp],
+    ) -> bool:
+        """Shifts child sqref attributes, removing children whose ranges were deleted."""
+        for child in elem.findall(child_tag):
+            new_sqref = shift_sqref(child.get("sqref", ""), row_ops, col_ops)
+            if new_sqref:
+                child.set("sqref", new_sqref)
+            else:
+                elem.remove(child)
+        return elem.find(child_tag) is not None
 
     @staticmethod
     def _prune_element(elem: etree._Element) -> None:
