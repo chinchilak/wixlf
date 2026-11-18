@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wixlf"
-version = "0.3.1"
+dynamic = ["version"]
 description = "Write Into XLSX Files — constant-memory, multiprocess streaming writer for existing .xlsx/.xlsm workbooks."
 readme = "README.md"
 license = "MIT"
@@ -28,6 +28,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/chinchilak/wixlf"
 Issues = "https://github.com/chinchilak/wixlf/issues"
+
+[tool.hatch.version]
+path = "src/wixlf/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wixlf"]

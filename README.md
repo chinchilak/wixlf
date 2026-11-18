@@ -213,8 +213,9 @@ src/wixlf/
 ├── __init__.py          # Public API: patch_workbook, add_sheet, delete_sheets, move_sheet,
 │                        #             insert_rows, delete_rows, insert_cols, delete_cols, clear_cells
 ├── constants.py         # OOXML namespaces, QName tags, content-types, and type aliases
-├── models.py            # Immutable slotted dataclasses (SheetInfo, CellEdit, SheetEditPlan,
-│                        #   NewSheetSpec, SheetMoveSpec, SheetStructureMutation, WorksheetTaskPayload)
+├── models.py            # Immutable slotted dataclasses (Formula, SheetInfo, CellEdit, SheetEditPlan,
+│                        #   ClearRangeSpec, NewSheetSpec, SheetMoveSpec, SheetStructureMutation,
+│                        #   WorksheetTaskPayload)
 ├── reader.py            # PackageReader: resolves sheet names & tab order to internal zip XML paths
 ├── patcher.py           # SheetStreamPatcher, patch_sheet_worker & create_sheet_worker (O(1) memory)
 ├── assembler.py         # PackageAssembler: ProcessPoolExecutor orchestrator, Table resizing,
@@ -222,9 +223,10 @@ src/wixlf/
 └── utils/
     ├── __init__.py      # Re-exports shared utility functions
     ├── coords.py        # Pure-Python coordinate, range & column converters (zero regex)
+    ├── names.py         # Excel worksheet name validation (zero regex)
     ├── shifting.py      # Pure-Python row/col index, range & formula reference rewriter (zero regex)
-    ├── xml_text.py      # XML 1.0 text sanitization & Excel 1900 serial date conversion
-    └── zip_io.py        # Raw compressed zip entry copy, ZipInfo cloning, and OOXML path resolution
+    ├── xml_text.py      # Hardened XML parsing, XML 1.0 text sanitization & Excel 1900 serial dates
+    └── zip_io.py        # Streaming zip entry copy (Zip64-aware), ZipInfo cloning, .rels parsing & OOXML path resolution
 ```
 
 ---

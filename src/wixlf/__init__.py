@@ -22,7 +22,7 @@ from .utils.coords import check_cell_bounds, parse_col_ref, parse_range
 from .utils.names import validate_sheet_name
 from .utils.shifting import AxisShiftOp
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "AxisShiftOp",
