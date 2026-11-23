@@ -25,7 +25,7 @@ from .utils.names import validate_sheet_name
 from .utils.shifting import AxisShiftOp
 from .visibility import set_visibility, unhide_all_rows_and_columns, unhide_all_sheets
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "AxisShiftOp",
