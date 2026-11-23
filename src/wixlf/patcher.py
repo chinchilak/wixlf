@@ -1,6 +1,7 @@
 import math
 import zipfile
 from collections.abc import Sequence
+from copy import deepcopy
 from datetime import date, datetime, time
 
 from lxml import etree
@@ -37,6 +38,7 @@ from .constants import (
     TAG_PROTECTED_RANGES,
     TAG_ROW,
     TAG_ROW_BREAKS,
+    TAG_SHEET_FORMAT_PR,
     TAG_SELECTION,
     TAG_SHEET_DATA,
     TAG_SHEET_VIEW,
@@ -52,6 +54,7 @@ from .models import (
     RowEditBatch,
     SheetEditPlan,
     SheetStructureMutation,
+    SheetVisibilityMutation,
     WorksheetTaskPayload,
 )
 from .utils.coords import format_coord, parse_coord
@@ -88,9 +91,11 @@ class SheetStreamPatcher:
         if isinstance(payload, WorksheetTaskPayload):
             plan = payload.plan
             mutation = payload.mutation
+            visibility = payload.visibility
         else:
             plan = payload
             mutation = None
+            visibility = None
 
         with (
             zipfile.ZipFile(src_zip_path, "r") as zin,
@@ -98,7 +103,9 @@ class SheetStreamPatcher:
             etree.xmlfile(out_xml_path, encoding="utf-8") as xf,
         ):
             xf.write_declaration(standalone=True)
-            self._stream_transform(xml_in, xf, plan.rows, mutation, plan.clear_ranges)
+            self._stream_transform(
+                xml_in, xf, plan.rows, mutation, plan.clear_ranges, visibility
+            )
 
     def write_new_sheet(
         self,
@@ -123,6 +130,7 @@ class SheetStreamPatcher:
         row_batches: Sequence[RowEditBatch],
         mutation: SheetStructureMutation | None,
         clear_ranges: Sequence[ClearRangeSpec] = (),
+        visibility: SheetVisibilityMutation | None = None,
     ) -> None:
         context = etree.iterparse(
             xml_in,
@@ -149,9 +157,13 @@ class SheetStreamPatcher:
         with xf.element(TAG_WORKSHEET, attrib=ws_attrib, nsmap=ws_nsmap):
             in_sheet_data = False
             sheet_data_written = False
+            cols_seen = False
+            default_rows_hidden = False
             batch_idx = 0
             total_batches = len(row_batches)
             last_row = 0
+            visibility_rows = visibility.rows if visibility else ()
+            visibility_row_idx = 0
             pending_clears = sorted(clear_ranges, key=lambda c: c.min_row)
             clear_idx = 0
             active_clears: list[ClearRangeSpec] = []
@@ -159,8 +171,24 @@ class SheetStreamPatcher:
             for event, elem in context:
                 tag = elem.tag
 
+                if event == "start" and elem.getparent() is root_elem:
+                    if tag == TAG_COLS:
+                        cols_seen = True
+                    elif tag == TAG_SHEET_FORMAT_PR:
+                        default_rows_hidden = elem.get("zeroHeight") in ("1", "true")
+
                 # Track entry/exit of <sheetData>
                 if event == "start" and tag == TAG_SHEET_DATA:
+                    if (
+                        visibility is not None
+                        and visibility.columns
+                        and visibility.columns is not None
+                        and visibility.hidden
+                        and not cols_seen
+                    ):
+                        cols_elem = etree.Element(TAG_COLS)
+                        self._transform_visibility_cols(cols_elem, visibility)
+                        xf.write(cols_elem)
                     in_sheet_data = True
                     sheet_data_written = True
                     sd_attrib = dict(elem.attrib)
@@ -173,6 +201,16 @@ class SheetStreamPatcher:
                     while batch_idx < total_batches:
                         self._write_new_row(xf, row_batches[batch_idx])
                         batch_idx += 1
+                    while (
+                        visibility is not None
+                        and visibility.rows is not None
+                        and visibility.hidden
+                        and visibility_row_idx < len(visibility.rows)
+                    ):
+                        self._write_visibility_row(
+                            xf, visibility.rows[visibility_row_idx]
+                        )
+                        visibility_row_idx += 1
 
                     sd_ctx.__exit__(None, None, None)
                     in_sheet_data = False
@@ -189,6 +227,31 @@ class SheetStreamPatcher:
                         if raw_r is None:
                             elem.set("r", str(raw_row_num))
                         self._resolve_cell_columns(elem, raw_row_num)
+
+                        if visibility is not None:
+                            if visibility.rows is None:
+                                elem.attrib.pop("hidden", None)
+                            elif visibility.rows:
+                                while (
+                                    visibility_row_idx < len(visibility.rows)
+                                    and visibility.rows[visibility_row_idx] < raw_row_num
+                                ):
+                                    if visibility.hidden:
+                                        self._write_visibility_row(
+                                            xf, visibility.rows[visibility_row_idx]
+                                        )
+                                    visibility_row_idx += 1
+                                if (
+                                    visibility_row_idx < len(visibility.rows)
+                                    and visibility.rows[visibility_row_idx] == raw_row_num
+                                ):
+                                    if visibility.hidden:
+                                        elem.set("hidden", "1")
+                                    elif default_rows_hidden:
+                                        elem.set("hidden", "0")
+                                    else:
+                                        elem.attrib.pop("hidden", None)
+                                    visibility_row_idx += 1
 
                         target_row = (
                             shift_index(raw_row_num, row_ops)
@@ -257,6 +320,9 @@ class SheetStreamPatcher:
                         self._prune_element(elem)
                         continue
 
+                    if tag == TAG_SHEET_FORMAT_PR and visibility is not None:
+                        if visibility.rows is None:
+                            elem.attrib.pop("zeroHeight", None)
                     if (
                         has_any_shifts
                         and mutation is not None
@@ -264,6 +330,9 @@ class SheetStreamPatcher:
                     ):
                         self._prune_element(elem)
                         continue
+
+                    if tag == TAG_COLS and visibility is not None:
+                        self._transform_visibility_cols(elem, visibility)
 
                     xf.write(elem)
                     self._prune_element(elem)
@@ -440,6 +509,84 @@ class SheetStreamPatcher:
         for edit in cells_to_write:
             row_elem.append(self._build_cell_element(edit, inherited_style=None))
         xf.write(row_elem)
+
+    @staticmethod
+    def _write_visibility_row(xf: etree.xmlfile, row_idx: int) -> None:
+        xf.write(etree.Element(TAG_ROW, r=str(row_idx), hidden="1"))
+
+    @staticmethod
+    def _transform_visibility_cols(
+        cols_elem: etree._Element,
+        visibility: SheetVisibilityMutation,
+    ) -> None:
+        """Updates hidden column ranges while preserving each range's other attributes."""
+        requested = visibility.columns
+        if requested == ():
+            return
+
+        col_elements = list(cols_elem.findall(TAG_COL))
+        if requested is None:
+            for col_elem in col_elements:
+                col_elem.attrib.pop("hidden", None)
+            return
+
+        requested_set = set(requested)
+        covered: set[int] = set()
+        transformed: list[etree._Element] = []
+        for col_elem in col_elements:
+            min_col = int(col_elem.get("min", "1"))
+            max_col = int(col_elem.get("max", str(min_col)))
+            targets = sorted(c for c in requested_set if min_col <= c <= max_col)
+            if not targets:
+                transformed.append(col_elem)
+                continue
+
+            covered.update(targets)
+            boundaries = {min_col, max_col + 1}
+            for col_idx in targets:
+                boundaries.update((col_idx, col_idx + 1))
+            ordered = sorted(boundaries)
+            for start, end in zip(ordered, ordered[1:]):
+                segment = deepcopy(col_elem)
+                segment.set("min", str(start))
+                segment.set("max", str(end - 1))
+                if start in requested_set:
+                    if visibility.hidden:
+                        segment.set("hidden", "1")
+                    else:
+                        segment.attrib.pop("hidden", None)
+                transformed.append(segment)
+
+        missing = sorted(requested_set - covered)
+        if visibility.hidden:
+            start = previous = None
+            for col_idx in missing:
+                if start is None:
+                    start = previous = col_idx
+                elif col_idx == previous + 1:
+                    previous = col_idx
+                else:
+                    transformed.append(
+                        etree.Element(
+                            TAG_COL,
+                            min=str(start),
+                            max=str(previous),
+                            hidden="1",
+                        )
+                    )
+                    start = previous = col_idx
+            if start is not None:
+                transformed.append(
+                    etree.Element(
+                        TAG_COL,
+                        min=str(start),
+                        max=str(previous),
+                        hidden="1",
+                    )
+                )
+
+        transformed.sort(key=lambda col_elem: int(col_elem.get("min", "1")))
+        cols_elem[:] = transformed
 
     def _build_cell_element(
         self,

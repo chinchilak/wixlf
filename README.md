@@ -1,6 +1,6 @@
 # WIXLF — Write Into XLSX Files
 
-A high-performance, constant-memory Python 3.14+ library for modifying existing Excel (`.xlsx` / `.xlsm`) workbooks **in-place**. Instead of deserializing the entire workbook DOM into memory like `openpyxl`, **WIXLF** streams modified and newly created worksheets row-by-row via `lxml` while transferring untouched archive parts as raw compressed streams.
+A high-performance, constant-memory Python 3.14+ library for modifying existing Excel (`.xlsx` / `.xlsm`) workbooks **in-place**. Instead of deserializing the entire workbook DOM into memory like `openpyxl`, **WIXLF** streams modified and newly created worksheets row-by-row via `lxml` and transfers archive entries in fixed-size chunks.
 
 ---
 
@@ -10,7 +10,7 @@ A high-performance, constant-memory Python 3.14+ library for modifying existing 
 * **Row & Column Insertion / Deletion with Formula & Table Shifting:** Insert or delete rows and columns (`insert_rows`, `delete_rows`, `insert_cols`, `delete_cols`) while automatically shifting downstream cells, cross-sheet formulas (`<f>`), Excel Tables (`xl/tables/tableN.xml`), `<mergeCells>`, `<cols>` widths, `<autoFilter>`, conditional formatting, data validations, and `<definedNames>`.
 * **Clean Cell & Range Clearing (`clear_cells`):** Wipe cell values, strip styles (`clear_style=True`), or remove `<c>` elements (`drop_cells=True`) across individual coordinates or `A1:D10` ranges without shifting rows/columns.
 * **Worksheet Tab Management:** Create new populated or blank sheets (at any index or appended to the end), delete worksheets, and reorder sheet tabs (`move_sheet` to an index or to the end).
-* **Zero-Recompression Raw Stream Copy:** Untouched worksheets, `styles.xml`, themes, charts, pivot tables, drawings, media, and VBA macros (`.xlsm`) are copied directly as raw compressed zip payloads (`raw=True`) in 1 MB chunks—eliminating decompression/re-deflation CPU overhead on large files.
+* **Bounded-Memory ZIP Transfer:** Archive entries are copied one at a time in 1 MB chunks. Unchanged DEFLATE entries are recompressed using the selected compression level; package parts such as styles, charts, media, and VBA macros (`.xlsm`) are preserved.
 * **Fast Deflate (`compresslevel=1`):** Modified and newly created XML entries default to `compresslevel=1` (configurable up to `9`), accelerating writes while keeping file sizes compact.
 * **Constant $O(1)$ Memory Footprint:** Streams `<worksheet>` XML via `lxml.etree.iterparse` + `lxml.etree.xmlfile` with immediate DOM node pruning (`elem.clear()` and preceding-sibling deletion).
 * **Per-Worksheet Multiprocessing:** Dispatches dirty and newly created worksheets across a `ProcessPoolExecutor` (bypassing the GIL) when 2+ sheets are processed and their combined size is $\ge$ 512 KB (tunable via `PackageAssembler(parallel_threshold_bytes=...)`); smaller jobs run inline.
@@ -104,7 +104,41 @@ wixlf.move_sheet("report.xlsx", "Cover", position=None)
 wixlf.delete_sheets("report.xlsx", ["OldData", "Temp"])
 ```
 
-### 4. Combined Atomic Operations in One Pass
+### 4. Show and Hide Worksheets, Rows, and Columns
+
+```python
+import wixlf
+
+# Unhide every row and column in every worksheet
+wixlf.unhide_all_rows_and_columns("report.xlsx")
+
+# Unhide every worksheet tab, including veryHidden sheets
+wixlf.unhide_all_sheets("report.xlsx")
+
+# Hide rows and columns by worksheet (indices are 1-based; columns accept letters or indices)
+wixlf.set_visibility(
+    "report.xlsx",
+    rows={"Sales": [2, 5], "Summary": [10]},
+    columns={"Sales": ["B", "D", "E", "F"]},
+    hidden=True,
+)
+
+# Unhide selected rows and columns
+wixlf.set_visibility(
+    "report.xlsx",
+    rows={"Sales": [5]},
+    columns={"Sales": ["D"]},
+    hidden=False,
+)
+
+# Worksheet tabs support Excel's visible, hidden, and veryHidden states
+wixlf.set_visibility("report.xlsx", sheets={"Summary": "veryHidden"})
+wixlf.set_visibility("report.xlsx", sheets={"Summary": "visible"})
+```
+
+For rows and columns, use `hidden=True` to hide the listed targets and `hidden=False` to unhide them. Use `"all"` as a per-sheet target only with `hidden=False`. `unhide_all_rows_and_columns()` also processes hidden and `veryHidden` sheets without changing their tab visibility. Worksheet tab states are set independently via the `sheets` mapping. `unhide_all_sheets()` leaves row and column visibility unchanged. The workbook must retain at least one visible worksheet.
+
+### 5. Combined Atomic Operations in One Pass
 
 Combine cell edits, row/column shifts, new sheets, deletions, and tab moves into a single `patch_workbook()` call so the archive is only rewritten once:
 
@@ -209,24 +243,31 @@ if __name__ == "__main__":
 ## Package Architecture
 
 ```text
-src/wixlf/
-├── __init__.py          # Public API: patch_workbook, add_sheet, delete_sheets, move_sheet,
-│                        #             insert_rows, delete_rows, insert_cols, delete_cols, clear_cells
-├── constants.py         # OOXML namespaces, QName tags, content-types, and type aliases
-├── models.py            # Immutable slotted dataclasses (Formula, SheetInfo, CellEdit, SheetEditPlan,
-│                        #   ClearRangeSpec, NewSheetSpec, SheetMoveSpec, SheetStructureMutation,
-│                        #   WorksheetTaskPayload)
-├── reader.py            # PackageReader: resolves sheet names & tab order to internal zip XML paths
-├── patcher.py           # SheetStreamPatcher, patch_sheet_worker & create_sheet_worker (O(1) memory)
-├── assembler.py         # PackageAssembler: ProcessPoolExecutor orchestrator, Table resizing,
-│                        #   DefinedName formula updates, raw zip copy & atomic writer
-└── utils/
-    ├── __init__.py      # Re-exports shared utility functions
-    ├── coords.py        # Pure-Python coordinate, range & column converters (zero regex)
-    ├── names.py         # Excel worksheet name validation (zero regex)
-    ├── shifting.py      # Pure-Python row/col index, range & formula reference rewriter (zero regex)
-    ├── xml_text.py      # Hardened XML parsing, XML 1.0 text sanitization & Excel 1900 serial dates
-    └── zip_io.py        # Streaming zip entry copy (Zip64-aware), ZipInfo cloning, .rels parsing & OOXML path resolution
+.
+├── .gitignore
+├── .github/
+│   └── workflows/
+│       └── publish.yml  # Package publishing workflow
+├── README.md
+├── pyproject.toml       # Project metadata, dependencies, and build configuration
+├── requirements.txt
+├── test_readme.py       # Root-level unittest coverage for documented behavior
+└── src/
+    └── wixlf/
+        ├── __init__.py  # Package-root API and convenience functions
+        ├── assembler.py # Workbook ZIP assembly, table/defined-name updates, atomic output
+        ├── constants.py # OOXML namespaces, element tags, and shared type aliases
+        ├── models.py    # Immutable edit plans, worksheet metadata, and operation payloads
+        ├── patcher.py   # Streaming worksheet XML patcher and worker entry points
+        ├── reader.py    # Reads workbook metadata and maps sheet names to archive paths
+        ├── visibility.py # Worksheet-tab, row, and column visibility operations
+        └── utils/
+            ├── __init__.py # Shared utility exports
+            ├── coords.py   # Cell/range/column coordinate parsing and formatting
+            ├── names.py    # Worksheet-name validation
+            ├── shifting.py # Row/column index, range, and formula-reference shifting
+            ├── xml_text.py # Hardened XML parsing, text sanitization, and date serials
+            └── zip_io.py   # ZIP entry streaming, ZipInfo cloning, and relationship helpers
 ```
 
 ---

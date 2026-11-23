@@ -14,6 +14,8 @@ from .models import (
     SheetInfo,
     SheetMoveSpec,
     SheetStructureMutation,
+    SheetVisibilityMutation,
+    SheetVisibilityState,
     WorksheetTaskPayload,
 )
 from .patcher import SheetStreamPatcher, create_sheet_worker, patch_sheet_worker
@@ -21,6 +23,7 @@ from .reader import PackageReader
 from .utils.coords import check_cell_bounds, parse_col_ref, parse_range
 from .utils.names import validate_sheet_name
 from .utils.shifting import AxisShiftOp
+from .visibility import set_visibility, unhide_all_rows_and_columns, unhide_all_sheets
 
 __version__ = "0.4.0"
 
@@ -40,6 +43,8 @@ __all__ = [
     "SheetMoveSpec",
     "SheetStreamPatcher",
     "SheetStructureMutation",
+    "SheetVisibilityMutation",
+    "SheetVisibilityState",
     "WorksheetTaskPayload",
     "__version__",
     "add_sheet",
@@ -53,6 +58,9 @@ __all__ = [
     "move_sheet",
     "patch_sheet_worker",
     "patch_workbook",
+    "set_visibility",
+    "unhide_all_rows_and_columns",
+    "unhide_all_sheets",
     "validate_sheet_name",
 ]
 

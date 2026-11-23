@@ -40,6 +40,8 @@ from .models import (
     SheetEditPlan,
     SheetMoveSpec,
     SheetStructureMutation,
+    SheetVisibilityMutation,
+    SheetVisibilityState,
     WorksheetTaskPayload,
 )
 from .patcher import create_sheet_worker
@@ -128,6 +130,8 @@ class PackageAssembler:
         delete_sheets: Iterable[str] = (),
         move_sheets: Sequence[SheetMoveSpec] = (),
         shift_ops: Mapping[str, tuple[Sequence[AxisShiftOp], Sequence[AxisShiftOp]]] | None = None,
+        sheet_states: Mapping[str, SheetVisibilityState] | None = None,
+        visibility: Mapping[str, SheetVisibilityMutation] | None = None,
         update_formulas: bool = True,
         force_recalc: bool = True,
     ) -> None:
@@ -149,6 +153,8 @@ class PackageAssembler:
             and not delete_set
             and not move_sheets
             and not normalized_shifts
+            and not sheet_states
+            and not visibility
         ):
             if self.src_path.resolve() != self.dst_path.resolve():
                 shutil.copy2(self.src_path, self.dst_path)
@@ -166,6 +172,8 @@ class PackageAssembler:
                 delete_set=delete_set,
                 move_sheets=move_sheets,
                 shift_ops=normalized_shifts,
+                sheet_states=sheet_states or {},
+                visibility=visibility or {},
             )
 
             # Exclude any sheets scheduled for deletion from patching
@@ -174,6 +182,25 @@ class PackageAssembler:
                 for path, edits in dirty_map.items()
                 if path not in deleted_zip_paths
             }
+
+            for sheet_name, visibility_mutation in (visibility or {}).items():
+                sheet_path = surviving_sheets[sheet_name]
+                existing_item = effective_dirty.get(sheet_path)
+                plan = (
+                    existing_item.plan
+                    if isinstance(existing_item, WorksheetTaskPayload)
+                    else (existing_item or SheetEditPlan.empty())
+                )
+                mutation = (
+                    existing_item.mutation
+                    if isinstance(existing_item, WorksheetTaskPayload)
+                    else None
+                )
+                effective_dirty[sheet_path] = WorksheetTaskPayload(
+                    plan=plan,
+                    mutation=mutation,
+                    visibility=visibility_mutation,
+                )
 
             # Attach shift/formula payloads to locally shifted sheets and any
             # surviving sheets that actually contain '<f' formula tags.
@@ -207,6 +234,11 @@ class PackageAssembler:
                         effective_dirty[s_zip_path] = WorksheetTaskPayload(
                             plan=plan,
                             mutation=mutation,
+                            visibility=(
+                                existing_item.visibility
+                                if isinstance(existing_item, WorksheetTaskPayload)
+                                else None
+                            ),
                         )
 
             patched_files = self._run_sheet_workers(
@@ -225,6 +257,7 @@ class PackageAssembler:
                 table_shifts_by_zip=table_shifts_by_zip,
                 delete_sheet_names=delete_set,
                 move_sheets=move_sheets,
+                sheet_states=sheet_states or {},
                 shift_ops=normalized_shifts if update_formulas else {},
                 update_formulas=update_formulas,
                 strip_calc_chain=force_recalc,
@@ -236,6 +269,8 @@ class PackageAssembler:
         delete_set: set[str],
         move_sheets: Sequence[SheetMoveSpec],
         shift_ops: Mapping[str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]],
+        sheet_states: Mapping[str, SheetVisibilityState],
+        visibility: Mapping[str, SheetVisibilityMutation],
     ) -> tuple[
         list[_AllocatedNewSheet],
         set[str],
@@ -256,9 +291,6 @@ class PackageAssembler:
             existing_sheets_by_name = {
                 name: info.zip_path for name, info in sheet_infos.items()
             }
-            visible_names = {
-                name for name, info in sheet_infos.items() if info.state == "visible"
-            }
             max_sheet_id = max(
                 (int(info.sheet_id) for info in sheet_infos.values() if info.sheet_id.isdigit()),
                 default=0,
@@ -270,10 +302,6 @@ class PackageAssembler:
                 raise KeyError(
                     f"Cannot delete unknown worksheet(s): {sorted(unknown_deletes)}"
                 )
-
-            remaining_visible = len(visible_names - delete_set) + len(new_sheets)
-            if remaining_visible < 1:
-                raise ValueError("Workbook must retain at least one visible worksheet.")
 
             deleted_zip_paths = {existing_sheets_by_name[name] for name in delete_set}
             surviving_sheets = {
@@ -330,6 +358,22 @@ class PackageAssembler:
 
         # Validate move targets
         final_names = surviving_names | seen_new_names
+        unknown_states = set(sheet_states) - final_names
+        if unknown_states:
+            raise KeyError(f"Cannot change visibility of unknown worksheet(s): {sorted(unknown_states)}")
+        for state in sheet_states.values():
+            if state not in ("visible", "hidden", "veryHidden"):
+                raise ValueError(f"Invalid worksheet visibility state: {state!r}")
+        unknown_visibility = set(visibility) - surviving_names
+        if unknown_visibility:
+            raise KeyError(f"Cannot change rows/columns on unknown worksheet(s): {sorted(unknown_visibility)}")
+        if not any(
+            sheet_states.get(name, sheet_infos[name].state) == "visible"
+            for name in surviving_names
+        ) and not any(
+            sheet_states.get(name, "visible") == "visible" for name in seen_new_names
+        ):
+            raise ValueError("Workbook must retain at least one visible worksheet.")
         for move in move_sheets:
             if move.name not in final_names:
                 raise KeyError(f"Cannot move unknown worksheet: {move.name!r}")
@@ -451,6 +495,7 @@ class PackageAssembler:
         ],
         delete_sheet_names: set[str],
         move_sheets: Sequence[SheetMoveSpec],
+        sheet_states: Mapping[str, SheetVisibilityState],
         shift_ops: Mapping[str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]],
         update_formulas: bool,
         strip_calc_chain: bool,
@@ -566,6 +611,7 @@ class PackageAssembler:
                             allocated_new=allocated_new,
                             delete_sheet_names=delete_sheet_names,
                             move_sheets=move_sheets,
+                            sheet_states=sheet_states,
                             shift_ops=shift_ops,
                             update_formulas=update_formulas,
                             force_recalc=strip_calc_chain,
@@ -921,6 +967,7 @@ class PackageAssembler:
         allocated_new: Sequence[_AllocatedNewSheet],
         delete_sheet_names: set[str],
         move_sheets: Sequence[SheetMoveSpec],
+        sheet_states: Mapping[str, SheetVisibilityState],
         shift_ops: Mapping[str, tuple[tuple[AxisShiftOp, ...], tuple[AxisShiftOp, ...]]],
         update_formulas: bool,
         force_recalc: bool,
@@ -947,6 +994,11 @@ class PackageAssembler:
             orig_order, allocated_new, delete_sheet_names, move_sheets
         )
         sheet_nodes = [node_by_name[n] for n in final_order]
+        for name, state in sheet_states.items():
+            if state == "visible":
+                node_by_name[name].attrib.pop("state", None)
+            else:
+                node_by_name[name].set("state", state)
 
         # Replace <sheets> children in final tab order
         sheets_elem[:] = sheet_nodes
@@ -987,6 +1039,15 @@ class PackageAssembler:
             for attr in ("activeTab", "firstSheet"):
                 if attr in wb_view.attrib:
                     new_idx = remap_index(wb_view.get(attr))
+                    if (
+                        attr == "activeTab"
+                        and sheet_states
+                        and (new_idx is None or sheet_nodes[new_idx].get("state", "visible") != "visible")
+                    ):
+                        new_idx = next(
+                            i for i, sheet in enumerate(sheet_nodes)
+                            if sheet.get("state", "visible") == "visible"
+                        )
                     wb_view.set(attr, str(new_idx if new_idx is not None else 0))
 
         if force_recalc:

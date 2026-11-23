@@ -1,5 +1,6 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from .constants import CellScalar
 from .utils.coords import check_cell_bounds, parse_coord
@@ -22,6 +23,18 @@ class SheetInfo:
     rel_id: str
     zip_path: str  # e.g., "xl/worksheets/sheet1.xml"
     state: str = "visible"  # "visible" | "hidden" | "veryHidden"
+
+
+type SheetVisibilityState = Literal["visible", "hidden", "veryHidden"]
+
+
+@dataclass(frozen=True, slots=True)
+class SheetVisibilityMutation:
+    """Visibility changes for rows and columns on a single worksheet."""
+
+    rows: tuple[int, ...] | None = ()
+    columns: tuple[int, ...] | None = ()
+    hidden: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,3 +177,4 @@ class WorksheetTaskPayload:
 
     plan: SheetEditPlan
     mutation: SheetStructureMutation | None = None
+    visibility: SheetVisibilityMutation | None = None
