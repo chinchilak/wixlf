@@ -10,6 +10,7 @@ A high-performance, constant-memory Python 3.14+ library for modifying existing 
 * **Row & Column Insertion / Deletion with Formula & Table Shifting:** Insert or delete rows and columns (`insert_rows`, `delete_rows`, `insert_cols`, `delete_cols`) while automatically shifting downstream cells, cross-sheet formulas (`<f>`), Excel Tables (`xl/tables/tableN.xml`), `<mergeCells>`, `<cols>` widths, `<autoFilter>`, conditional formatting, data validations, and `<definedNames>`.
 * **Clean Cell & Range Clearing (`clear_cells`):** Wipe cell values, strip styles (`clear_style=True`), or remove `<c>` elements (`drop_cells=True`) across individual coordinates or `A1:D10` ranges without shifting rows/columns.
 * **Worksheet Tab Management:** Create new populated or blank sheets (at any index or appended to the end), delete worksheets, and reorder sheet tabs (`move_sheet` to an index or to the end).
+* **JSON Table Operations:** Convert JSON records into bulk cell edits, write them to existing or new sheets, and read worksheet tables back as records or serialized JSON.
 * **Bounded-Memory ZIP Transfer:** Archive entries are copied one at a time in 1 MB chunks. Unchanged DEFLATE entries are recompressed using the selected compression level; package parts such as styles, charts, media, and VBA macros (`.xlsm`) are preserved.
 * **Fast Deflate (`compresslevel=1`):** Modified and newly created XML entries default to `compresslevel=1` (configurable up to `9`), accelerating writes while keeping file sizes compact.
 * **Constant $O(1)$ Memory Footprint:** Streams `<worksheet>` XML via `lxml.etree.iterparse` + `lxml.etree.xmlfile` with immediate DOM node pruning (`elem.clear()` and preceding-sibling deletion).
@@ -175,6 +176,58 @@ wixlf.patch_workbook(
 
 ---
 
+## JSON Table Operations
+
+```python
+import wixlf
+
+records = [
+    {"id": 101, "product": "Widget A", "price": 19.99, "in_stock": True},
+    {"id": 102, "product": "Widget B", "price": 45.00, "in_stock": False},
+]
+
+# The workbook must already exist. Add a new sheet, or omit create_sheet to patch one.
+wixlf.write_json_to_excel("report.xlsx", "Inventory", records, create_sheet=True)
+
+# Both Python records and a serialized JSON array of objects are accepted.
+wixlf.write_json_to_excel(
+    "report.xlsx", "Inventory", '[{"id": 103, "product": "Widget C"}]',
+    columns=["id", "product"], start_row=5, start_col=2, include_header=False,
+    dst_path="copy.xlsx",
+)
+
+# Compose bulk JSON edits with other operations in one atomic workbook rewrite.
+cells = wixlf.json_to_cells(records, columns=["id", "product", "price", "in_stock"])
+wixlf.patch_workbook("report.xlsx", {"Inventory": cells})
+
+parsed_records = wixlf.excel_to_json("report.xlsx", "Inventory")
+json_text = wixlf.excel_to_json("report.xlsx", "Inventory", as_json_str=True)
+```
+
+Coordinates are 1-based. `json_to_cells()` and `write_json_to_excel()` infer columns
+in first-seen key order, or use the supplied `columns` order. Headers are included
+unless `include_header=False`. Missing fields become blank cells, and nested objects
+and arrays are stored as JSON text in a single cell. Empty input produces no cells
+unless explicit columns request a header-only table. Writes patch only the supplied
+cells: old data outside that rectangle is not cleared.
+
+Strings starting with `=` remain text by default. Use `parse_formulas=True` on
+either writing helper only for trusted input to interpret them as formulas.
+
+`excel_to_json()` supports `header_row` and `start_col` for offset tables. It ignores
+blank headers, rejects duplicate header names, fills missing cells with `None`,
+and skips rows whose selected cells are all blank. It reads shared/inline text,
+numbers, booleans, and cached formula values; it does not calculate formulas
+(missing cached values become `None`), decode date styles, or automatically parse
+nested JSON text. Excel errors and ISO date cells are returned as strings.
+Missing worksheets raise `KeyError`; missing or empty header rows return an empty list.
+
+The JSON helpers materialize cell mappings or returned records in memory; they do
+not have the core XML writer's constant-memory guarantee. Worksheet XML is read
+row-by-row without an intermediate grid, but shared strings are loaded in memory.
+
+---
+
 ## Supported Cell Types & Styling
 
 ### Data Types & Formulas
@@ -251,12 +304,13 @@ if __name__ == "__main__":
 ├── README.md
 ├── pyproject.toml       # Project metadata, dependencies, and build configuration
 ├── requirements.txt
-├── test_readme.py       # Root-level unittest coverage for documented behavior
+├── test_json_io.py      # JSON conversion and workbook round-trip unittest coverage
 └── src/
     └── wixlf/
         ├── __init__.py  # Package-root API and convenience functions
         ├── assembler.py # Workbook ZIP assembly, table/defined-name updates, atomic output
         ├── constants.py # OOXML namespaces, element tags, and shared type aliases
+        ├── json_io.py   # JSON record conversion and worksheet table reading
         ├── models.py    # Immutable edit plans, worksheet metadata, and operation payloads
         ├── patcher.py   # Streaming worksheet XML patcher and worker entry points
         ├── reader.py    # Reads workbook metadata and maps sheet names to archive paths

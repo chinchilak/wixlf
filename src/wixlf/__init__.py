@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .assembler import PackageAssembler
 from .constants import CellScalar, PatchWorkerFn
+from .json_io import JSONRecords, excel_to_json, json_to_cells
 from .models import (
     CellEdit,
     ClearRangeSpec,
@@ -25,7 +26,7 @@ from .utils.names import validate_sheet_name
 from .utils.shifting import AxisShiftOp
 from .visibility import set_visibility, unhide_all_rows_and_columns, unhide_all_sheets
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "AxisShiftOp",
@@ -53,8 +54,10 @@ __all__ = [
     "delete_cols",
     "delete_rows",
     "delete_sheets",
+    "excel_to_json",
     "insert_cols",
     "insert_rows",
+    "json_to_cells",
     "move_sheet",
     "patch_sheet_worker",
     "patch_workbook",
@@ -62,6 +65,7 @@ __all__ = [
     "unhide_all_rows_and_columns",
     "unhide_all_sheets",
     "validate_sheet_name",
+    "write_json_to_excel",
 ]
 
 type CellMapInput = Mapping[str | tuple[int, int], CellScalar] | SheetEditPlan
@@ -188,6 +192,38 @@ def add_sheet(
         max_workers=max_workers,
         compresslevel=compresslevel,
     )
+
+
+def write_json_to_excel(
+    xlsx_path: str | Path,
+    sheet_name: str,
+    records: JSONRecords | str,
+    *,
+    create_sheet: bool = False,
+    start_row: int = 1,
+    start_col: int = 1,
+    columns: list[str] | None = None,
+    include_header: bool = True,
+    parse_formulas: bool = False,
+    dst_path: str | Path | None = None,
+) -> None:
+    """Write a JSON table to an existing workbook, optionally adding a sheet.
+
+    Patches only the supplied rectangle; existing cells outside it are retained.
+    Modifies xlsx_path in-place unless dst_path is specified.
+    """
+    cells = json_to_cells(
+        records,
+        start_row=start_row,
+        start_col=start_col,
+        columns=columns,
+        include_header=include_header,
+        parse_formulas=parse_formulas,
+    )
+    if create_sheet:
+        add_sheet(xlsx_path, name=sheet_name, data=cells, dst_path=dst_path)
+    else:
+        patch_workbook(xlsx_path, {sheet_name: cells}, dst_path=dst_path)
 
 
 def delete_sheets(
